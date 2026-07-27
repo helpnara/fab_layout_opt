@@ -440,6 +440,139 @@ def transport_stack_svg(
 
 
 # =========================================================================
+# 부하-사이클타임 곡선
+# =========================================================================
+
+
+def load_curve_svg(
+    points: list[tuple[float, float, float, float]],
+    capacity_lots_per_day: float,
+    title: str = "투입률에 따른 거동",
+    width: float = 720,
+    panel_h: float = 168,
+) -> str:
+    """(투입률 비율, X-factor, 달성 처리량, 병목 가동률) 곡선.
+
+    X-factor와 처리량은 단위와 범위가 달라 한 축에 겹칠 수 없다. 축을 두 개 그리는
+    대신 **패널을 위아래로 나누고 x축을 공유**한다 (이중축 금지).
+    """
+    left, right, top, gap = 58.0, 86.0, 60.0, 40.0
+    H = top + panel_h * 2 + gap + 52
+    plot_w = width - left - right
+    xs = [p[0] for p in points]
+    x_lo, x_hi = min(xs), max(xs)
+
+    def px(v: float) -> float:
+        return left + plot_w * (v - x_lo) / (x_hi - x_lo) if x_hi > x_lo else left
+
+    s = _Svg(width, H, [], aria=f"{title} — 투입률 대 X-factor 및 처리량")
+    s.rect(0, 0, width, H, fill=SURFACE)
+    s.text(16, 22, title, size=14, weight="600")
+    s.text(16, 39, f"가로축 = 해석적 병목 능력({capacity_lots_per_day:.2f} lot/일) 대비 투입률"
+                   " · 두 패널은 x축을 공유한다", size=10, fill=INK2)
+
+    def panel(y0: float, values: list[float], label: str, fmt: str,
+              baseline: float | None, baseline_label: str) -> None:
+        v_hi = max(values) * 1.12
+        v_lo = min(min(values), baseline if baseline else min(values)) * 0.92
+
+        def py(v: float) -> float:
+            return y0 + panel_h - panel_h * (v - v_lo) / (v_hi - v_lo)
+
+        s.rect(left, y0, plot_w, panel_h, fill="none", stroke=GRID, sw=1)
+        s.text(left, y0 - 7, label, size=10.5, fill=INK, weight="600")
+        for k in range(4):
+            v = v_lo + (v_hi - v_lo) * k / 3
+            s.line(left, py(v), left + plot_w, py(v), stroke=GRID, sw=1)
+            s.text(left - 6, py(v) + 3.5, f"{v:{fmt}}", size=9, fill=INK3, anchor="end")
+        if baseline is not None:
+            s.line(left, py(baseline), left + plot_w, py(baseline),
+                   stroke=INK3, sw=1.5, dash="5 3")
+            s.text(left + plot_w + 5, py(baseline) + 3.5, baseline_label,
+                   size=9, fill=INK3)
+        pts = " ".join(f"{_n(px(x))},{_n(py(v))}" for x, v in zip(xs, values))
+        s.add(f'<polyline points="{pts}" fill="none" stroke="{SEQ[4]}" '
+              f'stroke-width="2" stroke-linejoin="round"/>')
+        for x, v in zip(xs, values):
+            s.add(f'<circle cx="{_n(px(x))}" cy="{_n(py(v))}" r="4" fill="{SEQ[4]}" '
+                  f'stroke="{SURFACE}" stroke-width="2"><title>'
+                  f'투입 {x:.0%} → {v:{fmt}}</title></circle>')
+        # 마지막 점만 직접 라벨 (모든 점에 숫자를 붙이지 않는다)
+        s.text(px(xs[-1]) + 9, py(values[-1]) + 3.5, f"{values[-1]:{fmt}}",
+               size=10, fill=INK, weight="600")
+
+    panel(top, [p[1] for p in points], "X-factor (사이클타임 ÷ 순수 처리시간)",
+          ".2f", 1.0, "대기 없음")
+    y2 = top + panel_h + gap
+    panel(y2, [p[2] for p in points], "달성 처리량 (lot/일)",
+          ".2f", capacity_lots_per_day, "해석적 상한")
+
+    for x in xs:
+        s.line(px(x), y2 + panel_h, px(x), y2 + panel_h + 4, stroke=INK3, sw=1)
+        s.text(px(x), y2 + panel_h + 16, f"{x:.0%}", size=9, fill=INK3, anchor="middle")
+    s.text(left + plot_w / 2, y2 + panel_h + 34, "투입률 (병목 능력 대비)",
+           size=9.5, fill=INK2, anchor="middle")
+    return s.render()
+
+
+# =========================================================================
+# 이론값 대조 (편차 도표)
+# =========================================================================
+
+
+def deviation_svg(
+    rows: list[tuple[str, float, float, float]],
+    title: str = "대기행렬 이론과의 대조",
+    subtitle: str = "",
+    width: float = 720,
+    row_h: float = 34,
+) -> str:
+    """(사례, 실측, 이론, 허용오차) → 편차 도표.
+
+    "맞았는가"를 보는 데는 두 값을 나란히 놓은 막대보다 **0을 기준으로 한 편차**가
+    낫다. 허용오차 띠 안에 점이 들어왔는지가 한눈에 보인다.
+    """
+    left, right, top = 168.0, 96.0, 74.0
+    H = top + len(rows) * row_h + 44
+    plot_w = width - left - right
+    span = max(max(abs(m / t - 1.0) for _, m, t, _ in rows),
+               max(tol for *_, tol in rows)) * 1.35
+
+    def px(dev: float) -> float:
+        return left + plot_w / 2 + (plot_w / 2) * dev / span
+
+    s = _Svg(width, H, [], aria=f"{title} — 사례 {len(rows)}건의 이론값 대비 편차")
+    s.rect(0, 0, width, H, fill=SURFACE)
+    s.text(16, 22, title, size=14, weight="600")
+    if subtitle:
+        s.text(16, 39, subtitle, size=10, fill=INK2)
+    s.text(16, 56, "점 = 이론값 대비 편차 · 회색 띠 = 허용오차 · 세로선 = 완전 일치",
+           size=9.5, fill=INK3)
+
+    for i, (label, measured, theory, tol) in enumerate(rows):
+        y = top + i * row_h + row_h / 2
+        s.rect(px(-tol), y - 11, px(tol) - px(-tol), 22, fill=SURFACE2, rx=3,
+               title=f"허용오차 ±{tol:.0%}")
+        dev = measured / theory - 1.0
+        ok = abs(dev) <= tol
+        s.text(left - 10, y + 4, label, size=10, fill=INK, anchor="end")
+        s.line(px(0), y - 11, px(0), y + 11, stroke=INK3, sw=1)
+        s.line(px(0), y, px(dev), y, stroke=INK3, sw=1.5)
+        s.add(f'<circle cx="{_n(px(dev))}" cy="{_n(y)}" r="5.5" '
+              f'fill="{GOOD if ok else CRITICAL}" stroke="{SURFACE}" stroke-width="1.5">'
+              f'<title>{_e(label)} — 실측 {measured:.2f} vs 이론 {theory:.2f} '
+              f'({dev:+.1%}, 허용 ±{tol:.0%})</title></circle>')
+        s.text(left + plot_w + 8, y + 4, f"{dev:+.1%}", size=10,
+               fill=INK, weight="600")
+
+    ay = top + len(rows) * row_h + 16
+    s.text(px(0), ay, "0", size=9, fill=INK3, anchor="middle")
+    s.text(px(-span), ay, f"{-span:+.0%}", size=9, fill=INK3, anchor="middle")
+    s.text(px(span), ay, f"{span:+.0%}", size=9, fill=INK3, anchor="middle")
+    return s.render()
+
+
+# =========================================================================
 # 라우트 행렬 (재진입 흐름)
 # =========================================================================
 

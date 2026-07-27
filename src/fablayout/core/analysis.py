@@ -65,13 +65,23 @@ class CapacityReport:
         return tuple(g for g in self.groups if g.capacity_lots_per_day <= limit)
 
 
-def analytic_capacity(fab: Fab, counts: dict[str, int] | None = None) -> CapacityReport:
-    """설비 대수 구성만으로 결정되는 생산능력 상한."""
+def analytic_capacity(
+    fab: Fab,
+    counts: dict[str, int] | None = None,
+    batching: bool = True,
+) -> CapacityReport:
+    """설비 대수 구성만으로 결정되는 생산능력 상한.
+
+    `batching=False`면 배치 설비가 lot을 모으지 못하고 한 번에 하나씩 처리한다고 본다.
+    배치 형성이 아직 구현되지 않은 M2 엔진과 **같은 전제로** 비교하기 위한 것이다.
+    전제가 다르면 "DES 실측 ≤ 해석적 상한"이라는 정합성 검증이 성립하지 않는다.
+    """
     visits = fab.weighted_visits()
     loads: list[GroupLoad] = []
     for gid, group in fab.groups.items():
         n = group.count if counts is None else counts[gid]
-        workload = visits[gid] * group.minutes_per_lot
+        per_lot = group.minutes_per_lot if batching else group.process_minutes
+        workload = visits[gid] * per_lot
         if workload <= 0:
             capacity = float("inf")
         elif n <= 0:

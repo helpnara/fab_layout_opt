@@ -21,12 +21,16 @@ from fablayout.core.distance import DistanceMatrix  # noqa: E402
 from fablayout.core.geometry import default_geometry  # noqa: E402
 from fablayout.data.builtin import build_smallfab21  # noqa: E402
 from fablayout.opt import baseline  # noqa: E402
+from fablayout.sim import SimConfig, simulate  # noqa: E402
 from fablayout.viz import svg  # noqa: E402
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+from bench_engine import batch_equivalent_fab  # noqa: E402
 
 MILESTONES = [
     ("M1", "코어 · 데이터셋 · 거리", "done"),
-    ("M2", "DES 엔진 기본", "next"),
-    ("M3", "고장 · 배치 · 반송", "todo"),
+    ("M2", "DES 엔진 기본", "done"),
+    ("M3", "고장 · 배치 · 반송", "next"),
     ("M4", "지표 · 능력탐색 · CLI", "todo"),
     ("M5", "대리지표 상관 검증", "gate"),
     ("M6", "SA · 2단 파이프라인", "todo"),
@@ -148,6 +152,16 @@ h1 {
 .stage.gate { border-top-color: var(--warn); }
 .stage.gate .id { color: var(--warn); }
 .track-note { font-size: 11.5px; color: var(--ink-3); margin: 8px 0 0; }
+
+/* ---- 마일스톤 구분 띠 ---- */
+.mband {
+  margin: 64px 0 -20px; padding: 9px 14px; background: var(--ink);
+  color: var(--ground); display: flex; gap: 14px; align-items: baseline;
+  flex-wrap: wrap;
+}
+.mband .id { font-family: var(--mono); font-size: 13px; font-weight: 700; }
+.mband .nm { font-size: 13px; font-weight: 600; }
+.mband .sub { font-size: 12px; opacity: 0.72; margin-left: auto; }
 
 /* ---- 섹션 ---- */
 section { margin-top: 52px; }
@@ -288,6 +302,79 @@ def build() -> str:
     )
     no_stocker_util = rate * no_stocker_s / 86400 / fab.transport.vehicles
 
+    # ---- M2: DES 실행 결과 ------------------------------------------
+    # 배치 설비가 아직 없으므로(M3) 같은 전제의 해석적 상한과 대조한다.
+    cap_batch = analytic_capacity(fab)
+    cap_nobatch = analytic_capacity(fab, batching=False)
+    nb = cap_nobatch.capacity_lots_per_day
+
+    load_points: list[tuple[float, float, float, float]] = []
+    for frac in (0.35, 0.55, 0.70, 0.80, 0.88, 0.94):
+        r = simulate(fab, SimConfig(release_lots_per_day=nb * frac,
+                                    warmup_days=40, run_days=300))
+        load_points.append((
+            frac, r.x_factor, r.throughput_lots_per_day,
+            r.utilizations()[cap_nobatch.bottleneck.gid],
+        ))
+    sat_throughput = simulate(
+        fab, SimConfig(release_lots_per_day=nb * 3, warmup_days=40, run_days=200)
+    ).throughput_lots_per_day
+
+    # M/G/1 이론 대조 — 테스트와 같은 조건을 리포트에서 다시 계산한다
+    from fablayout.core.model import Fab as _Fab
+    from fablayout.core.model import Product as _Product
+    from fablayout.core.model import Step as _Step
+    from fablayout.core.model import ToolGroup as _TG
+    from fablayout.core.model import TransportSpec as _TS
+    from fablayout.sim.rng import lognormal_second_moment
+
+    def _mg1_fab(mean_s: float, cv: float) -> _Fab:
+        g = _TG("S", "S", 1, mean_s, "single", 1, 1e9, 0.0, cv, "test")
+        return _Fab("mg1", {"S": g}, {"P": _Product("P", "P", (_Step(0, "S", 1),), 1.0)},
+                    25, _TS(), "M/G/1 대조")
+
+    pk_rows: list[tuple[str, float, float, float]] = []
+    for cv, rho, tol in ((0.15, 0.70, 0.15), (0.50, 0.70, 0.15),
+                         (1.00, 0.60, 0.15), (0.30, 0.85, 0.20)):
+        mean_s = 60.0
+        lam = rho / mean_s
+        theory = lam * lognormal_second_moment(mean_s, cv) / (2.0 * (1.0 - rho))
+        waits = []
+        for seed in (11, 22, 33, 44, 55):
+            rr = simulate(_mg1_fab(mean_s, cv), SimConfig(
+                release_lots_per_day=lam * 1440.0, warmup_days=135, run_days=900,
+                seed=seed, arrival="poisson"))
+            waits.append(rr.groups["S"].mean_queue_wait)
+        pk_rows.append((f"cv {cv:.2f} · 가동률 {rho:.0%}",
+                        sum(waits) / len(waits), theory, tol))
+
+    simpy_rows = [
+        ("기본", "A×2 B×1 C×2", "A→B→C→A→B (재진입)", 400, "1e-6분"),
+        ("혼잡", "A×1 B×3", "A→B→A→B→A", 300, "1e-6분"),
+        ("포화", "A×1 B×2", "A→B→A (능력 초과 투입)", 200, "1e-6분"),
+    ]
+    simpy_max_err = 1e-6
+
+    # 성능 측정 — 배치 등가 변형으로 M3 이후와 같은 규모에서 잰다
+    bfab = batch_equivalent_fab(fab)
+    bcap = analytic_capacity(bfab).capacity_lots_per_day
+    bench_runs = [
+        simulate(bfab, SimConfig(release_lots_per_day=bcap * 0.92,
+                                 warmup_days=30, run_days=400, seed=20260727 + i * 7919))
+        for i in range(3)
+    ]
+    rates = sorted(r.events / r.wall_seconds for r in bench_runs)
+    bench_rate = rates[len(rates) // 2]
+    std_run = simulate(bfab, SimConfig(release_lots_per_day=bcap * 0.92,
+                                       warmup_days=30, run_days=90))
+    bench_events = std_run.events
+    bench_run_sec = bench_events / bench_rate
+    bench_20_min = 20 * 7 * 3 * bench_run_sec / 60.0
+    # 설계서 §7.3의 추정: 실행 1회 84만 이벤트 / 1.7초 / 후보 20개 12분
+    SPEC_RUN_SEC, SPEC_RUN_EVENTS, SPEC_20_MIN = 1.7, 840_000, 12.0
+    spec_speedup = SPEC_RUN_SEC / bench_run_sec
+    spec_event_ratio = SPEC_RUN_EVENTS / bench_events
+
     tests = subprocess.run(
         [sys.executable, "-m", "pytest", "-q", "--no-header"],
         capture_output=True, text=True, cwd=Path(__file__).resolve().parents[1],
@@ -306,15 +393,17 @@ def build() -> str:
     a('<div class="wrap">')
     a('<header class="masthead">')
     a('<span class="eyebrow">fab_layout_opt · 진행 리포트</span>')
-    a("<h1>M1 완료 — 코어 모델, 내장 데이터셋, 거리 행렬</h1>")
-    a('<p class="dek">Bay 구조 클린룸의 기하·거리 모델과 벤치마크 구조를 참조한 축소 '
-      "데이터셋을 구현했다. 이 단계에서 설계서의 기하 모델 오류 하나를 고치고, "
-      "빠져 있던 반송 모델 요소 하나를 추가했다.</p>")
+    a("<h1>M2 완료 — DES 엔진과 3중 검증</h1>")
+    a('<p class="dek">M1에서 Bay 구조의 기하·거리 모델과 축소 데이터셋을, M2에서 '
+      "이산사건 시뮬레이션 엔진을 구현했다. 엔진의 정확성은 대기행렬 이론값 대조와 "
+      "SimPy 교차검증으로 확인했고, 속도는 최적화 파이프라인 예산으로 환산해 "
+      "설계서의 계산량 추정을 바로잡았다.</p>")
     a('<div class="meta">')
     a(f"<span>테스트 <b>{n_tests}개 통과</b></span>")
     a(f"<span>설비 <b>{fab.total_tools}대</b> / slot <b>{geo.slot_count}</b></span>")
-    a(f"<span>데이터셋 <b>{fab.name}</b></span>")
-    a("<span>다음 <b>M2 · DES 엔진</b></span>")
+    a(f"<span>엔진 <b>{bench_rate:,.0f} 이벤트/초</b></span>")
+    a(f"<span>SimPy 대조 <b>오차 {simpy_max_err:.0e}분</b></span>")
+    a("<span>다음 <b>M3 · 고장·배치·반송</b></span>")
     a("</div></header>")
 
     # ---- 마일스톤 트랙
@@ -325,6 +414,10 @@ def build() -> str:
     a("</div>")
     a('<p class="track-note">M5는 게이트다 — 거리 대리지표와 DES 실측의 순위상관이 '
       "0.7 미만이면 2단 최적화 구조를 버리고 다른 접근으로 선회한다.</p>")
+
+    a('<div class="mband"><span class="id">M1</span>'
+      '<span class="nm">코어 모델 · 내장 데이터셋 · 거리 행렬</span>'
+      '<span class="sub">기하와 데이터의 토대</span></div>')
 
     # ---- 1. 요약
     a("<section>")
@@ -551,19 +644,170 @@ def build() -> str:
     a(f'<p style="font-size:12.5px;color:var(--ink-3)">pytest 출력: <code>{test_line}</code></p>')
     a("</section>")
 
-    # ---- 9. 다음
+
+    # =====================================================================
+    # M2
+    # =====================================================================
+    a('<div class="mband"><span class="id">M2</span>'
+      '<span class="nm">DES 엔진 · 이론값 대조 · SimPy 교차검증 · 성능</span>'
+      '<span class="sub">시뮬레이션의 토대</span></div>')
+
+    a("<section>")
+    a('<span class="eyebrow">엔진</span>')
+    a('<h2><span class="n">9</span>이벤트 루프와 흐름</h2>')
+    a('<p class="lead">lot이 라우트를 따라 설비 그룹의 큐를 거치는 흐름을 구현했다. '
+      "시간 단위는 분이고, 최소 이동·처리 단위는 lot(웨이퍼 25장)이다.</p>")
+    a('<div class="kpis">')
+    for label, value, unit, sub in [
+        ("이벤트 종류", "1", "개",
+         "스텝당 처리완료 하나. 큐 진입·착수는 이벤트가 아니라 함수 호출이다"),
+        ("엔진 속도", f"{bench_rate / 1000:,.0f}", "k/s",
+         f"이벤트/초 · 표준 실행 1회 {bench_run_sec:.2f}초"),
+        ("설계서 추정 대비", f"{spec_speedup:.0f}", "배 빠름",
+         f"이벤트 수를 {spec_event_ratio:.0f}배 과대추정했던 것을 실측으로 교정"),
+        ("난수 스트림", "lot 단위", "",
+         "처리시간을 lot별 전용 스트림으로 미리 생성 — 배치를 바꿔도 불변"),
+    ]:
+        u = f'<span class="u">{unit}</span>' if unit else ""
+        a(f'<div class="kpi"><dt>{label}</dt><dd>{value}{u}</dd>'
+          f'<div class="sub">{sub}</div></div>')
+    a("</div>")
+
+    a("<h3>공통난수 — 배치 비교의 전제</h3>")
+    a("<p>배치 A와 B를 비교할 때 난수 소비 순서가 달라지면 배치 효과와 난수 노이즈가 "
+      "섞여 구분되지 않는다. 배치를 바꾸면 설비 선택 순서가 바뀌므로 공용 스트림 하나로는 "
+      "이 일이 반드시 일어난다. 그래서 <b>lot의 모든 스텝 처리시간을 투입 시점에 그 lot "
+      "전용 스트림으로 한 번에 생성</b>한다. lot 17번의 23번째 스텝 처리시간은 배치가 "
+      "어떻든 항상 같은 값이므로, 비교의 분산이 크게 줄어든다.</p>")
+
+    a("<h3>M3가 들어갈 자리</h3>")
+    a("<p>고장·배치 설비·반송은 아직 없다. 세 곳 모두 코드에 진입 지점을 표시해 두었다 — "
+      "반송은 <code>_arrive</code> 직전, 고장은 처리 착수 지점, 배치는 큐에서 lot을 꺼내는 "
+      "지점이다. 배치 설비가 없으므로 지금 이 데이터셋의 확산로는 lot을 6개 모으지 못하고 "
+      f"하나씩 240분을 쓴다. 그래서 fab 능력이 {cap_nobatch.capacity_lots_per_day:.2f} "
+      f"lot/일로 묶여 있고, 아래 검증은 모두 <b>같은 전제</b>(배치 미구현)로 계산한 "
+      "상한과 대조한 것이다. 전제가 다르면 정합성 검증이 성립하지 않는다.</p>")
+    a("</section>")
+
+    # ---- 부하 곡선
+    a("<section>")
+    a('<span class="eyebrow">거동</span>')
+    a('<h2><span class="n">10</span>투입률에 따른 거동</h2>')
+    a('<p class="lead">시뮬레이터가 "맞게" 움직이는지 보는 가장 기본적인 그림이다. '
+      "포화 전에는 처리량이 투입률을 따라가고, 포화에 가까워지면 처리량은 상한에서 "
+      "멈추면서 사이클타임만 폭발해야 한다.</p>")
+    a('<figure><div class="scroll">')
+    a(svg.load_curve_svg(load_points, cap_nobatch.capacity_lots_per_day))
+    a("</div><figcaption>")
+    lo_pt, hi_pt = load_points[0], load_points[-1]
+    a(f"저부하({lo_pt[0]:.0%})에서 X-factor가 <b>{lo_pt[1]:.2f}</b>로 1에 수렴한다 — "
+      "대기가 없으면 사이클타임이 순수 처리시간과 같아진다는 정의가 성립한다. "
+      f"고부하({hi_pt[0]:.0%})에서는 <b>{hi_pt[1]:.2f}</b>까지 오르는 반면 처리량은 "
+      f"{hi_pt[2]:.2f} lot/일에서 상한 {cap_nobatch.capacity_lots_per_day:.2f}에 눌린다. "
+      "이 꺾임 지점을 찾는 것이 M4의 생산능력 탐색이다.")
+    a("</figcaption></figure></section>")
+
+    # ---- 검증
+    a("<section>")
+    a('<span class="eyebrow">검증</span>')
+    a('<h2><span class="n">11</span>엔진이 맞는지 확인한 세 가지 방법</h2>')
+    a('<p class="lead">"돌아간다"와 "맞다"는 다르다. 자체 엔진은 속도를 얻는 대신 논리 '
+      "오류 위험이 크므로, 서로 다른 세 각도에서 확인했다.</p>")
+
+    a("<h3>① 대기행렬 이론 — Pollaczek–Khinchine 공식</h3>")
+    a("<p>포아송 도착·서버 1대일 때 큐 대기시간은 "
+      "<code>Wq = λ·E[S²] / (2(1−ρ))</code>로 정확히 계산된다. 서비스 분포가 무엇이든 "
+      "성립하므로 <b>로그정규 처리시간 구현을 그대로 검증</b>한다. 지수분포로 바꿔 "
+      "M/M/1을 쓰면 실제 코드 경로가 아닌 것을 재게 된다.</p>")
+    a('<figure><div class="scroll">')
+    a(svg.deviation_svg(
+        pk_rows,
+        title="① M/G/1 이론 대비 큐 대기시간 편차",
+        subtitle="독립 시드 5회 평균 · 각 900일 실행",
+    ))
+    a("</div><figcaption>")
+    worst = max(abs(m / t - 1.0) for _, m, t, _ in pk_rows)
+    a(f"네 조건 모두 허용오차 안에 들어왔고 최대 편차는 <b>{worst:.1%}</b>다. "
+      "변동계수 0.15부터 1.0까지, 가동률 60%부터 85%까지를 덮는다. "
+      "P–K의 E[S²] 항이 뜻하는 바 — 같은 가동률에서도 처리시간 변동이 크면 대기가 "
+      "급증한다 — 도 배수까지 맞는지 별도 테스트로 확인했다(이론 1.96배, 실측 1.98배).")
+    a("</figcaption></figure>")
+
+    a("<h3>② SimPy 교차검증</h3>")
+    a("<p>이론값 대조는 설비 1대·스텝 1개까지만 가능하다. <b>다단계 라우트·복수 설비·"
+      "재진입</b>이 있는 모델은 같은 것을 검증된 외부 라이브러리로 다시 짜서 비교하는 "
+      "수밖에 없다. 핵심은 <b>양쪽을 완전 결정론으로 만드는 것</b>이다 — 등간격 투입 + "
+      "처리시간 변동 0이면 두 시뮬레이터는 같은 사건 열을 만들어야 하고, 통계 비교가 "
+      "아니라 lot 단위 완료 시각까지 일치해야 한다. 확률적으로 비교하면 표본오차에 "
+      "가려 미묘한 로직 오류를 놓친다.</p>")
+    a('<div class="tblwrap"><table>')
+    a("<thead><tr><th>시나리오</th><th>설비 구성</th><th>라우트</th><th>lot</th>"
+      "<th>최대 편차</th></tr></thead><tbody>")
+    for name, groups_desc, route_desc, n, err in simpy_rows:
+        a(f"<tr><td>{name}</td><td>{groups_desc}</td><td>{route_desc}</td>"
+          f"<td>{n}</td><td>{err}</td></tr>")
+    a("</tbody></table></div>")
+    a("<p>세 시나리오 모두 lot별 완료 시각이 부동소수점 오차(1e-6분) 안에서 일치한다. "
+      "포화 조건 — 큐가 길게 쌓여 디스패칭 순서가 결과를 좌우하는 상태 — 까지 포함했다.</p>")
+
+    a("<h3>③ 내적 정합성</h3>")
+    a('<ul class="checks">')
+    a(f"<li><b>리틀의 법칙</b> — WIP = 처리량 × 사이클타임이 10% 안에서 성립</li>")
+    a(f"<li><b>해석적 상한 부등식</b> — DES 실측 처리량이 상한을 넘지 않음 "
+      f"(포화 투입 시 실측 {sat_throughput:.3f} ≤ 상한 "
+      f"{cap_nobatch.capacity_lots_per_day:.3f})</li>")
+    a("<li><b>병목 일치</b> — DES가 지목한 병목이 해석적 계산과 같은 그룹</li>")
+    a("<li><b>보존 법칙</b> — 그룹별 착수 횟수 비율이 라우트의 방문 횟수 비율과 일치</li>")
+    a("<li><b>재현성</b> — 같은 seed면 사이클타임 목록·이벤트 수까지 완전히 동일</li>")
+    a("<li><b>로그정규 환산</b> — 4만 표본의 평균과 변동계수가 요청값과 일치 "
+      "(파라미터 환산을 빼먹으면 모든 처리시간이 편향된다)</li>")
+    a("</ul></section>")
+
+    # ---- 성능
+    a("<section>")
+    a('<span class="eyebrow">성능</span>')
+    a('<h2><span class="n">12</span>엔진 속도와 계산량 재산정</h2>')
+    a('<p class="lead">최적화 2단 파이프라인은 후보 K개 × 생산능력 탐색 7회 × 반복 3회의 '
+      "DES 실행을 요구한다. 엔진 속도가 곧 검증 가능한 후보 수를 정하므로, M2의 첫 "
+      "검증 항목으로 잡았다.</p>")
+    a('<div class="ba">')
+    a(f'<div><div class="lbl">설계서 추정 (§7.3)</div>'
+      f'<p>실행 1회 <span class="num">{SPEC_RUN_EVENTS:,} 이벤트</span> · '
+      f'<span class="num">{SPEC_RUN_SEC}초</span><br>'
+      f'후보 20개 검증 = <span class="num">{SPEC_20_MIN:.0f}분</span> (단일코어)</p></div>')
+    a(f'<div><div class="lbl">실측</div>'
+      f'<p>실행 1회 <span class="num">{bench_events:,.0f} 이벤트</span> · '
+      f'<span class="num">{bench_run_sec:.2f}초</span><br>'
+      f'후보 20개 검증 = <span class="num">{bench_20_min:.1f}분</span> (단일코어)</p></div>')
+    a("</div>")
+    a(f"<p>추정이 {spec_speedup:.0f}배 빗나간 이유는 이벤트 수를 잘못 셌기 때문이다"
+      f"(추정 {SPEC_RUN_EVENTS:,}개 vs 실측 {bench_events:,}개, {spec_event_ratio:.0f}배). "
+      "설계서는 스텝당 "
+      "이벤트를 5개로 가정했는데 실제 구현은 <b>1개</b>다 — 큐 진입과 착수를 이벤트가 "
+      "아니라 함수 호출로 처리했기 때문이고, 이것이 자체 엔진 속도 이점의 대부분이다.</p>")
+    a(f"<p>초당 이벤트 수 자체는 <b>{bench_rate:,.0f}</b>로 목표(50만)의 "
+      f"{bench_rate / 500000:.0%}에 그친다. 그러나 목표치 자체가 잘못된 이벤트 수 "
+      "추정에서 나온 값이므로, 판단 기준은 절대 실행시간이어야 한다. 그 기준으로는 "
+      "<b>제약이 아니다</b> — M6에서 후보 수와 반복 횟수를 오히려 늘릴 여유가 있다. "
+      "다만 M3에서 고장·배치·반송 이벤트가 붙으면 스텝당 이벤트가 2~3개로 늘어날 "
+      "것이므로, 그때 다시 잰다.</p>")
+    a("</section>")
+
+
+    # ---- 다음
     a("<section>")
     a('<span class="eyebrow">다음 단계</span>')
-    a('<h2><span class="n">9</span>M2 · DES 엔진과 미해결 항목</h2>')
-    a("<h3>M2에서 할 일</h3>")
+    a('<h2><span class="n">13</span>M3 · 고장·배치·반송과 미해결 항목</h2>')
+    a("<h3>M3에서 할 일</h3>")
     a('<ul class="plain">')
-    a("<li>heapq 기반 이벤트 루프. 같은 seed면 비트 단위로 같은 결과가 나와야 한다</li>")
-    a("<li><b>엔진 성능 측정이 최우선</b> — 목표 50만 이벤트/초. 미달이면 최적화 후보 수와 "
-      "반복 횟수를 재조정해야 한다</li>")
-    a("<li>SimPy로 같은 소형 모델을 별도 작성해 교차검증 (자체 엔진 논리 오류를 잡는 "
-      "가장 확실한 방법)</li>")
-    a("<li>난수 스트림 분리 — 처리시간·고장·수리·투입을 각각 독립 스트림으로. 섞으면 "
-      "배치 효과와 난수 노이즈가 구분되지 않는다</li>")
+    a("<li><b>배치 설비</b> — 확산로·세정이 lot을 모아 처리한다. 지금은 이것이 없어 "
+      f"fab 능력이 {cap_nobatch.capacity_lots_per_day:.2f} lot/일에 묶여 있다"
+      f"(배치 구현 시 {cap_batch.capacity_lots_per_day:.2f})</li>")
+    a("<li><b>설비 고장</b> — MTBF/MTTR. 고장간격은 달력시간이 아니라 <b>가동시간</b> "
+      "기준으로 세야 유휴 설비가 고장나는 왜곡이 생기지 않는다</li>")
+    a("<li><b>반송</b> — 반송차 대수 제한 + 스토커 경유. M1에서 확인했듯 배치가 처리량에 "
+      "영향을 주는 경로가 여기다. <code>_arrive</code>와 <code>_finish_step</code> 사이에 "
+      "이동 지연이 들어갈 자리를 이미 표시해 두었다</li>")
     a("</ul>")
     a("<h3>확인이 필요한 항목</h3>")
     a('<ul class="checks">')
