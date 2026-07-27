@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -32,8 +33,8 @@ MILESTONES = [
     ("M1", "코어 · 데이터셋 · 거리", "done"),
     ("M2", "DES 엔진 기본", "done"),
     ("M3", "고장 · 배치 · 반송", "done"),
-    ("M4", "지표 · 능력탐색 · CLI", "next"),
-    ("M5", "대리지표 상관 검증", "gate"),
+    ("M4", "목표함수 · 능력탐색 · CLI", "done"),
+    ("M5", "대리지표 상관 검증", "gate next"),
     ("M6", "SA · 2단 파이프라인", "todo"),
     ("M7", "FastAPI · 배치도 UI", "todo"),
     ("M8", "비교 · 애니메이션", "todo"),
@@ -152,6 +153,7 @@ h1 {
 .stage.next .id { color: var(--accent); }
 .stage.gate { border-top-color: var(--warn); }
 .stage.gate .id { color: var(--warn); }
+.stage.next { background: var(--inset); }
 .track-note { font-size: 11.5px; color: var(--ink-3); margin: 8px 0 0; }
 
 /* ---- 마일스톤 구분 띠 ---- */
@@ -430,6 +432,86 @@ def build() -> str:
             0.05,
         ))
 
+    # ---- M4: 목표 함수와 탐색공간 -------------------------------------
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from explore_space import hill_climb, rebalance_chain, random_layouts  # noqa: E402
+    from fablayout.opt.objective import Candidate, Objective  # noqa: E402
+
+    explore_run_days = 180.0
+    obj = Objective.default(fab, geo, target_fraction=0.90,
+                            run_days=explore_run_days, replications=3)
+    photo_share = (obj.budget.model.unit_cost["PHOTO"] * fab.tool_counts["PHOTO"]
+                   / obj.budget.limit)
+
+    base_cand = obj.baseline_candidate(baseline.functional_layout(fab, geo))
+    _t0 = time.perf_counter()
+    base_ev = obj.evaluate(base_cand)
+    eval_seconds = time.perf_counter() - _t0
+    explore_base = base_ev.cycle_hours
+    explore_base_x = base_ev.x_factor
+
+    spread_ev = obj.evaluate(Candidate(baseline.spread_layout(fab, geo),
+                                       base_cand.counts, base_cand.vehicles))
+    explore_spread = spread_ev.cycle_hours
+    _, paired_ci = spread_ev.paired_delta(base_ev)
+    indep_ci = base_ev.cycle_hours_ci + spread_ev.cycle_hours_ci
+
+    random_vals = []
+    for asg in random_layouts(obj, base_cand.counts, 10, seed=7):
+        ev = obj.evaluate(Candidate(asg, base_cand.counts, base_cand.vehicles))
+        if ev.feasible:
+            random_vals.append(ev.cycle_hours)
+    n_better = sum(1 for v in random_vals if v < explore_base)
+    base_percentile = (n_better + 0.5) / max(len(random_vals), 1)
+
+    # 대수 재구성
+    chain = rebalance_chain(obj, rounds=2)
+    rebal_ev, rebal_counts = base_ev, base_cand.counts
+    rebal_desc = "변경 없음"
+    if chain:
+        counts = chain[0]
+        ev = obj.evaluate(Candidate(baseline.functional_layout(fab, geo, counts),
+                                    counts, base_cand.vehicles))
+        if ev.feasible:
+            rebal_ev, rebal_counts = ev, counts
+            diff = {g: counts[g] - base_cand.counts[g] for g in counts
+                    if counts[g] != base_cand.counts[g]}
+            rebal_desc = " ".join(f"{g}{n:+d}" for g, n in sorted(diff.items()))
+
+    # 배치 등반
+    climb_steps = 16
+    start = Candidate(baseline.functional_layout(fab, geo, rebal_counts),
+                      rebal_counts, base_cand.vehicles)
+    start_ev = obj.evaluate(start)
+    _, climb_ev, _, climb_accepted = hill_climb(obj, start, climb_steps, seed=11)
+    climb_delta, climb_ci = climb_ev.paired_delta(start_ev)
+    _, greedy_ev, _, greedy_accepted = hill_climb(obj, start, climb_steps, seed=11,
+                                                  require_significant=False)
+
+    def _pd(ev):
+        return ev.paired_delta(base_ev)
+
+    lever_rows = [
+        ("흩뿌림 배치 (대조군)", spread_ev.cycle_hours, *_pd(spread_ev),
+         spread_ev.capex, "동종 설비를 여러 bay로 분산"),
+        (f"대수 재구성 · {rebal_desc}", rebal_ev.cycle_hours, *_pd(rebal_ev),
+         rebal_ev.capex, "여유 그룹을 팔아 병목에 투자"),
+        ("+ 배치 등반", climb_ev.cycle_hours, *_pd(climb_ev),
+         climb_ev.capex, f"{climb_steps}스텝 중 {climb_accepted}회 수용"),
+    ]
+    total_gain = (min(climb_ev.cycle_hours, rebal_ev.cycle_hours) / explore_base) - 1
+
+    # 부하별 완료율 (지속 가능성 판정의 근거)
+    from fablayout.sim.capacity import check_stability  # noqa: E402
+    stability_rows = []
+    for frac in (0.70, 0.90, 1.05, 1.20):
+        rate = cap_batch.capacity_lots_per_day * frac
+        rr = simulate(fab, SimConfig(release_lots_per_day=rate, warmup_days=60,
+                                     run_days=180, collect_wip_series=True,
+                                     wip_sample_minutes=1440.0), func, geo)
+        v = check_stability(rr, rate, 60, 180)
+        stability_rows.append((f"부하 {frac:.0%}", v.throughput_ratio, 1.0, 0.05))
+
     tests = subprocess.run(
         [sys.executable, "-m", "pytest", "-q", "--no-header"],
         capture_output=True, text=True, cwd=Path(__file__).resolve().parents[1],
@@ -448,17 +530,19 @@ def build() -> str:
     a('<div class="wrap">')
     a('<header class="masthead">')
     a('<span class="eyebrow">fab_layout_opt · 진행 리포트</span>')
-    a("<h1>M3 완료 — 배치·고장·반송, 그리고 목표 함수를 다시 봐야 할 실측 결과</h1>")
-    a('<p class="dek">M1에서 기하·거리 모델을, M2에서 DES 엔진을, M3에서 배치 설비·'
-      "설비 고장·반송을 구현했다. 이제 처음으로 배치가 성능에 미치는 영향을 실제로 "
-      "측정할 수 있게 됐고, 그 결과가 <b>최적화 목표 함수 선택에 직접 영향</b>을 준다.</p>")
+    a("<h1>M4 완료 — 목표 함수 확정과 탐색공간 사전 점검</h1>")
+    a('<p class="dek">M3의 실측 결과에 따라 목표 함수를 <b>“capex 예산 제약 하에서 목표 '
+      "처리량을 만족하며 사이클타임 최소화”</b>로 확정했다. M4에서 그 목표 함수와 제약, "
+      "지속 가능성 판정, CLI를 구현하고, <b>최적화기를 만들기 전에 “이길 여지가 "
+      "있는가”를 먼저 측정했다</b>.</p>")
     a('<div class="meta">')
     a(f"<span>테스트 <b>{n_tests}개 통과</b></span>")
     a(f"<span>설비 <b>{fab.total_tools}대</b> / slot <b>{geo.slot_count}</b></span>")
     a(f"<span>엔진 <b>{bench_rate:,.0f} 이벤트/초</b></span>")
     a(f"<span>배치의 사이클타임 효과 <b>{layout_ct_gain:+.0%}</b></span>")
-    a("<span>배치의 처리량 효과 <b>없음</b></span>")
-    a("<span>다음 <b>M4 · 능력탐색</b></span>")
+    a(f"<span>기준선의 위치 <b>무작위 배치 상위 {base_percentile:.0%}</b></span>")
+    a(f"<span>최적화 여지 <b>{total_gain:+.1%}</b></span>")
+    a("<span>다음 <b>M5 · 대리지표 게이트</b></span>")
     a("</div></header>")
 
     # ---- 마일스톤 트랙
@@ -1000,18 +1084,180 @@ def build() -> str:
     a("</section>")
 
 
+
+    # =====================================================================
+    # M4
+    # =====================================================================
+    a('<div class="mband"><span class="id">M4</span>'
+      '<span class="nm">목표 함수 · 지속 가능성 판정 · CLI · 탐색공간 점검</span>'
+      '<span class="sub">최적화를 만들기 전에 이길 여지를 먼저 재다</span></div>')
+
+    a("<section>")
+    a('<span class="eyebrow">목표 함수</span>')
+    a('<h2><span class="n">18</span>무엇을 최소화하고 무엇을 제약으로 두는가</h2>')
+    a('<pre style="background:var(--inset);padding:14px 16px;border:1px solid var(--line);'
+      'font-family:var(--mono);font-size:12.5px;line-height:1.7;overflow-x:auto;margin:18px 0">'
+      "minimize   평균 사이클타임\n"
+      f"s.t.       capex(설비 대수, 반송차 대수) ≤ {obj.budget.limit:.1f}\n"
+      f"           지속 가능한 처리량 ≥ {obj.target_lots_per_day:.2f} lot/일 "
+      f"(해석적 상한 {cap_batch.capacity_lots_per_day:.2f}의 90%)\n"
+      "           slot 배타 (배치가 물리적으로 성립)</pre>")
+    a("<p>M3 실측에서 배치는 처리량을 바꾸지 못하고 사이클타임만 바꿨다. 그래서 "
+      "<b>처리량은 목적이 아니라 제약</b>으로 옮겼다. 역할이 이렇게 나뉜다 — "
+      "처리량은 설비·반송차 대수가 정하고(돈을 쓰는 결정), 사이클타임은 배치가 "
+      "정한다(돈을 쓰지 않고 얻는 것).</p>")
+
+    a('<div class="kpis">')
+    for label, value, unit, sub in [
+        ("평가 비용", f"{obj.replications}", "회 DES",
+         "목표 처리량 한 지점에서만 돌리면 된다. 원래 설계(능력탐색 7회×반복 3회=21회)의 "
+         "1/7"),
+        ("기준 예산", f"{obj.budget.limit:.1f}", "",
+         f"기준 구성과 동일 — 추가 투자 없이. 스캐너가 {photo_share:.0%}를 차지한다"),
+        ("기준선 사이클타임", f"{explore_base:.0f}", "h",
+         f"X-factor {explore_base_x:.2f} · 목표 처리량에서 측정"),
+        ("평가 1회 소요", f"{eval_seconds:.0f}", "초",
+         f"{obj.replications}회 반복 × (워밍업 60일 + 관측 {explore_run_days:.0f}일)"),
+    ]:
+        u = f'<span class="u">{unit}</span>' if unit else ""
+        a(f'<div class="kpi"><dt>{label}</dt><dd>{value}{u}</dd>'
+          f'<div class="sub">{sub}</div></div>')
+    a("</div>")
+
+    a("<h3>지속 가능성은 완료율로 판정한다</h3>")
+    a("<p>“목표 처리량을 만족하는가”를 판정해야 한다. WIP 추세로 정밀 판정하려던 시도는 "
+      "두 번 다 실패했다 — 회귀 기울기의 부호도, 기울기의 t검정도 판별력이 없었다. "
+      "부하 85%(완료율 1.018로 명백히 지속 가능)에서 이미 t=5.6이 나온다. 포화 근처에서는 "
+      "정상 상태 도달이 매우 느려 “느린 정착”과 “느린 발산”이 300일 관측으로도 구분되지 "
+      "않고, 일 단위 WIP 표본은 자기상관이 강해 회귀 표준오차가 크게 과소평가된다.</p>")
+    a("<p><b>완료율</b>(달성 처리량 ÷ 투입률)은 깨끗하게 갈린다 — 부하 60~97%에서 "
+      "0.995~1.023, 105%에서 0.890, 120%에서 0.685.</p>")
+    a('<figure><div class="scroll">')
+    a(svg.deviation_svg(
+        stability_rows,
+        title="부하별 완료율 — 지속 가능성 판정의 근거",
+        subtitle="완료율 1.0 = 들어온 만큼 나간다 · 회색 띠 = 표본 크기로 보정한 허용 범위",
+        legend="점 = 완료율의 1.0 대비 편차 · 세로선 = 완전히 따라감",
+        mark_status=False,
+    ))
+    a("</div><figcaption>")
+    a("판정 임계는 <b>표본 크기에 따라 달라져야 한다</b>. 완료 수가 적으면 완료율 자체가 "
+      "흔들려 고정 임계가 지속 가능한 후보를 오기각한다. 부하 70%(명백히 지속 가능)에서 "
+      "관측 창을 줄여가며 잰 완료율 최솟값은 40일 0.887 · 80일 0.918 · 180일 0.958 · "
+      "360일 0.971이었다. 편차가 대략 1/√N에 비례하므로 허용치를 <code>max(3%, 2/√N)</code>로 "
+      "잡았다. 워밍업이 사이클타임의 4배에 못 미칠 때도 같은 오기각이 나므로 경고를 붙인다 "
+      "— 최적화기 안에서 이런 오판이 나면 좋은 후보를 무작위로 버리게 된다.")
+    a("</figcaption></figure></section>")
+
+    # ---- 방향성 점검
+    a("<section>")
+    a('<span class="eyebrow">방향성 점검</span>')
+    a('<h2><span class="n">19</span>최적화가 기준선을 이길 여지가 있는가</h2>')
+    a('<p class="lead">최적화기를 만들기 전에 답해야 할 질문이다. <b>기준선이 이미 거의 '
+      "최선이면 최적화는 헛수고다.</b> 대수 구성을 고정하고 배치만 무작위로 바꿔가며 "
+      "분포를 재서, 기준선이 그 안 어디쯤인지 확인했다.</p>")
+    a('<figure><div class="scroll">')
+    a(svg.distribution_svg(
+        random_vals,
+        [("기준선 (기능별)", explore_base), ("흩뿌림", explore_spread)],
+        title="배치만 바꿨을 때의 사이클타임 분포",
+        subtitle=f"대수 구성 고정 · 무작위 배치 {len(random_vals)}개 · "
+                 f"각 {obj.replications}회 반복 × {explore_run_days:.0f}일",
+    ))
+    a("</div><figcaption>")
+    a(f"무작위 배치 {len(random_vals)}개 중 기준선보다 나은 것은 "
+      f"<b>{n_better}개</b>다. 기준선은 이 분포의 상위 {base_percentile:.0%} 지점이자 "
+      "분포 바깥에 있다. <b>기능별 배치는 이미 매우 좋다</b> — 실무 관행이 그렇게 "
+      "굳어진 데는 이유가 있다. 최적화기가 이기려면 무작위 탐색이 아니라 이 구조를 "
+      "유지한 채 미세 조정해야 한다.")
+    a("</figcaption></figure>")
+
+    a("<h3>세 갈래로 나눈 레버</h3>")
+    a('<div class="tblwrap"><table>')
+    a("<thead><tr><th>수단</th><th>사이클타임</th><th>기준선 대비(쌍대)</th>"
+      "<th>유의</th><th>capex</th><th>비고</th></tr></thead><tbody>")
+    for label, ct, d, ci, capex, note in lever_rows:
+        sig = "○" if abs(d) > ci else "—"
+        a(f"<tr><td>{label}</td><td>{ct:.1f}h</td>"
+          f"<td>{d:+.1f} ± {ci:.1f}h</td><td>{sig}</td>"
+          f"<td>{capex:.1f}</td><td>{note}</td></tr>")
+    a("</tbody></table></div>")
+    a(f"<p>대수 재구성(여유 그룹을 팔아 병목에 투자)이 {abs(lever_rows[1][2]):.1f}시간, "
+      f"그 위에서의 배치 등반이 추가 {abs(climb_delta):.1f}시간을 줄였다. 합쳐서 "
+      f"<b>{total_gain:+.1%}</b>다. 다만 대부분이 통계적으로 경계선에 있다 — 다음 절이 "
+      "그 얘기다.</p>")
+    a("</section>")
+
+    # ---- 잡음
+    a("<section>")
+    a('<span class="eyebrow">가장 중요한 제약</span>')
+    a('<h2><span class="n">20</span>잡음이 효과와 같은 크기다</h2>')
+    a('<p class="lead">이번 단계에서 가장 중요한 발견이다. 최적화 설계 전체를 좌우한다.</p>')
+    a('<div class="ba">')
+    a(f'<div><div class="lbl">찾는 것</div><p>배치 미세 조정의 개선폭 '
+      f'<span class="num">{abs(climb_delta):.1f}시간</span> '
+      f'({abs(climb_delta) / explore_base:.1%})</p></div>')
+    a(f'<div><div class="lbl">잴 수 있는 정밀도</div><p>쌍대 95% 신뢰구간 '
+      f'<span class="num">±{climb_ci:.1f}시간</span> '
+      f'({obj.replications}회 반복 × {explore_run_days:.0f}일)</p></div>')
+    a("</div>")
+    a("<p>같은 후보를 두 번 평가해도 시드에 따라 사이클타임이 190~216시간으로 흔들린다. "
+      "이 상태에서 평가값을 그냥 비교해 좋은 쪽을 취하면, 실제로 개선하지 않고도 "
+      "<b>운 좋은 평가만 골라 내려가는 편향</b>이 생긴다(winner's curse).</p>")
+    a("<h3>두 가지 대응</h3>")
+    a('<ul class="checks">')
+    a("<li><b>공통난수 + 쌍대 비교</b> — 후보들을 같은 시드로 평가하고 시드별로 짝지어 "
+      f"차이를 낸다. 시드가 만든 변동이 상쇄되어 실측 ±{indep_ci:.1f}시간이 "
+      f"±{paired_ci:.1f}시간으로, 약 {indep_ci / paired_ci:.1f}배 정밀해졌다</li>")
+    a("<li><b>유의한 개선만 수용</b> — 쌍대 차이가 신뢰구간을 넘을 때만 이동한다. "
+      f"등반 {climb_steps}스텝 중 수용은 {climb_accepted}회뿐이었다. 유의성을 무시하고 "
+      f"탐욕적으로 받으면 {greedy_accepted}회 수용하며 더 좋아 보이지만, 그중 상당수는 "
+      "잡음이다</li>")
+    a("</ul>")
+    a("<h3>M5·M6 설계에 주는 함의</h3>")
+    a(f"<p>후보 1개 평가에 {eval_seconds:.0f}초가 들고 그마저 ±{climb_ci:.1f}시간의 "
+      "불확실성을 남긴다. <b>DES를 직접 수천 번 돌리는 SA는 성립하지 않는다.</b> "
+      "결정론적이라 잡음이 0인 대리지표로 후보를 걸러내고 상위 소수만 DES로 검증하는 "
+      "2단 구조가, 원래 설계에서는 “속도를 위한 선택”이었지만 이제 <b>정확성을 위한 "
+      "필수 요건</b>이 됐다. M5의 대리지표 게이트가 그만큼 중요해졌다.</p>")
+    a("</section>")
+
+    # ---- CLI
+    a("<section>")
+    a('<span class="eyebrow">도구</span>')
+    a('<h2><span class="n">21</span>CLI</h2>')
+    a('<pre style="background:var(--inset);padding:14px 16px;border:1px solid var(--line);'
+      'font-family:var(--mono);font-size:12.5px;line-height:1.8;overflow-x:auto;margin:18px 0">'
+      "fablayout evaluate      기준선을 목표 함수로 평가\n"
+      "fablayout compare       기준선 배치 3종을 쌍대 비교\n"
+      "fablayout capacity      지속 가능한 최대 처리량 탐색\n"
+      "fablayout simulate      한 지점 시뮬레이션 + 그룹별 진단\n"
+      "fablayout report        이 리포트를 생성</pre>")
+    a("<p>모든 명령이 <code>--target</code>(목표 처리량), <code>--reps</code>(반복 횟수), "
+      "<code>--run-days</code>, <code>--vehicles</code>를 공통 옵션으로 받는다. "
+      "<code>compare</code>는 쌍대 차이와 유의성 표시를 함께 낸다.</p>")
+    a("</section>")
+
+
     # ---- 다음
     a("<section>")
     a('<span class="eyebrow">다음 단계</span>')
-    a('<h2><span class="n">18</span>M4 · 생산능력 탐색과 미해결 항목</h2>')
-    a("<h3>M4에서 할 일</h3>")
+    a('<h2><span class="n">22</span>M5 · 대리지표 게이트와 미해결 항목</h2>')
+    a("<h3>M5에서 할 일 — 이제 더 중요해졌다</h3>")
+    a("<p>M4의 잡음 측정 결과가 M5의 위상을 바꿨다. DES 평가는 후보 1개에 "
+      f"{eval_seconds:.0f}초가 들고 쌍대 신뢰구간이 ±{climb_ci:.1f}시간인데, 찾는 개선은 "
+      f"{abs(climb_delta):.1f}시간 규모다. <b>DES를 직접 수천 번 돌리는 최적화는 성립하지 "
+      "않는다.</b> 결정론적이라 잡음이 0인 대리지표로 후보를 걸러내는 2단 구조가 "
+      "선택이 아니라 필수가 됐다.</p>")
     a('<ul class="plain">')
-    a("<li><b>생산능력 탐색</b> — 투입률을 올려가며 WIP가 발산하기 직전 지점을 찾는다. "
-      "M3에서 확인했듯 <b>과투입으로 능력을 재면 안 된다</b>(§16). 조대 램프 + 이분 탐색</li>")
-    a("<li><b>WIP 안정성 판정</b> — 이번에 써 본 단순 기울기 판정은 잡음에 너무 민감했다. "
-      "회귀 기울기의 신뢰구간으로 판정하도록 다시 설계한다</li>")
-    a("<li><b>CLI와 리포트</b> — <code>fablayout simulate</code>로 시나리오 파일을 받아 "
-      "지표와 도면을 낸다</li>")
+    a("<li><b>대리지표 설계</b> — M1에서 확인했듯 스토커 항이 반송 부하의 지배항이므로, "
+      "흐름-거리만이 아니라 <b>bay 교차 횟수</b>를 주항으로 담아야 한다. 여기에 M3에서 "
+      "드러난 <b>서버 풀 분할</b>(그룹이 여러 bay로 흩어지면 대기가 는다)을 더한다</li>")
+    a(f"<li><b>게이트 판정</b> — 무작위 후보 100개의 대리지표 점수와 DES 실측 사이클타임의 "
+      f"순위상관 ρ ≥ 0.7. 이번에 만든 무작위 표본 {len(random_vals)}개가 "
+      "그 실험의 축소판이다</li>")
+    a("<li><b>미달 시 대안</b> — 대리모델 학습(회귀), 또는 탐색공간을 넓혀(기하 확대) "
+      "레버 자체를 키우는 방향</li>")
     a("</ul>")
     a("<h3>확인이 필요한 항목</h3>")
     a('<ul class="checks">')

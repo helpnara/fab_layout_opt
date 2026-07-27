@@ -654,6 +654,73 @@ def paired_bars_svg(
 
 
 # =========================================================================
+# 탐색공간 분포
+# =========================================================================
+
+
+def distribution_svg(
+    values: list[float],
+    markers: list[tuple[str, float]],
+    title: str = "",
+    subtitle: str = "",
+    unit: str = "h",
+    width: float = 720,
+    height: float = 176,
+) -> str:
+    """표본 분포를 점으로 늘어놓고, 기준선 등 관심 지점을 표식으로 얹는다.
+
+    "기준선이 이 분포의 어디쯤인가"가 최적화 여지를 판단하는 핵심 질문이다. 표본이
+    수십 개뿐이라 히스토그램은 구간 폭에 따라 모양이 달라지므로, 점을 그대로 보여준다.
+    """
+    left, right, top = 34.0, 34.0, 74.0 if subtitle else 58.0
+    plot_w = width - left - right
+    axis_y = top + 62
+    lo = min(list(values) + [v for _, v in markers])
+    hi = max(list(values) + [v for _, v in markers])
+    pad = (hi - lo) * 0.14 or 1.0
+    lo, hi = lo - pad, hi + pad
+
+    def px(v: float) -> float:
+        return left + plot_w * (v - lo) / (hi - lo)
+
+    s = _Svg(width, height, [], aria=title or "분포")
+    s.rect(0, 0, width, height, fill=SURFACE)
+    if title:
+        s.text(16, 22, title, size=14, weight="600")
+    if subtitle:
+        s.text(16, 39, subtitle, size=10, fill=INK2)
+
+    s.line(left, axis_y, left + plot_w, axis_y, stroke=LINE, sw=1)
+    for k in range(5):
+        v = lo + (hi - lo) * k / 4
+        s.line(px(v), axis_y, px(v), axis_y + 5, stroke=LINE, sw=1)
+        s.text(px(v), axis_y + 18, f"{v:.0f}{unit}", size=9, fill=INK3, anchor="middle")
+
+    # 표본 점 — 같은 값이 겹치면 위로 쌓는다
+    used: list[tuple[float, int]] = []
+    for v in sorted(values):
+        x = px(v)
+        row = 0
+        while any(abs(x - ux) < 9 and row == ur for ux, ur in used):
+            row += 1
+        used.append((x, row))
+        s.add(f'<circle cx="{_n(x)}" cy="{_n(axis_y - 9 - row * 11)}" r="4.5" '
+              f'fill="{SEQ[2]}" stroke="{SURFACE}" stroke-width="1.2">'
+              f'<title>{v:.1f}{_e(unit)}</title></circle>')
+
+    for i, (label, v) in enumerate(markers):
+        x = px(v)
+        color = CRITICAL if i == 0 else CAT[min(i, len(CAT) - 1)]
+        s.line(x, axis_y + 6, x, top - 4, stroke=color, sw=2)
+        ly = top - 8 + i * 13
+        anchor = "start" if x < left + plot_w * 0.7 else "end"
+        dx = 6 if anchor == "start" else -6
+        s.text(x + dx, ly, f"{label} {v:.0f}{unit}", size=10, fill=color,
+               anchor=anchor, weight="700")
+    return s.render()
+
+
+# =========================================================================
 # 라우트 행렬 (재진입 흐름)
 # =========================================================================
 
