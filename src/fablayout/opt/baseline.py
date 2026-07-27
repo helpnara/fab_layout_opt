@@ -20,7 +20,7 @@ from typing import Literal
 from ..core.geometry import LayoutGeometry, SlotId
 from ..core.model import Assignment, Fab
 
-BaselineKind = Literal["functional", "spread", "random"]
+BaselineKind = Literal["functional", "family", "spread", "random"]
 
 
 def _bay_centrality_order(geo: LayoutGeometry) -> list[int]:
@@ -104,6 +104,62 @@ def functional_layout(
     return Assignment(placement=placement)
 
 
+def family_layout(
+    fab: Fab,
+    geo: LayoutGeometry,
+    counts: dict[str, int] | None = None,
+) -> Assignment:
+    """**공정 계열별 배치** — 실제 fab에 더 가까운 기준선.
+
+    실무의 클린룸은 그룹 단위가 아니라 **공정 계열(포토·식각·성막·열처리·평탄화·주입·계측)**
+    단위로 구획된다. 특히 코터/디벨로퍼(트랙)는 스캐너와 물리적으로 짝을 이루므로 같은
+    구역에 둔다 — 그룹 단위로만 뭉치는 `functional_layout`은 이 짝을 갈라놓아 실무보다
+    불리한 기준선이 된다.
+
+    계열을 방문 빈도 합 순으로 정렬해 중앙 bay부터 채우고, 계열 안에서는 다시 방문이
+    잦은 그룹부터 놓는다.
+    """
+    counts = counts or fab.tool_counts
+    bays = _bay_centrality_order(geo)
+    free: dict[int, list[SlotId]] = {b: _bay_slots(geo, b) for b in bays}
+    visits = fab.weighted_visits()
+
+    families: dict[str, list[str]] = {}
+    for gid in fab.groups:
+        if counts[gid] > 0:
+            families.setdefault(fab.groups[gid].family or gid, []).append(gid)
+    order = sorted(
+        families,
+        key=lambda f: (-sum(visits[g] * counts[g] for g in families[f]), f),
+    )
+
+    placement: dict[str, SlotId] = {}
+    for fam in order:
+        members = sorted(families[fam], key=lambda g: (-visits[g], g))
+        need = sum(counts[g] for g in members)
+        # 계열 전체가 들어가는 가장 중앙 bay 묶음을 찾는다
+        chosen: list[int] = []
+        left = need
+        for b in bays:
+            if not free[b]:
+                continue
+            chosen.append(b)
+            left -= len(free[b])
+            if left <= 0:
+                break
+        if left > 0:
+            raise ValueError(
+                f"slot 부족: 설비 {sum(counts.values())}대 > slot {geo.slot_count}개"
+            )
+        for gid in members:
+            for i in range(counts[gid]):
+                for b in chosen:
+                    if free[b]:
+                        placement[f"{gid}#{i + 1}"] = free[b].pop(0)
+                        break
+    return Assignment(placement=placement)
+
+
 def spread_layout(
     fab: Fab,
     geo: LayoutGeometry,
@@ -161,6 +217,8 @@ def build(
 ) -> Assignment:
     if kind == "functional":
         return functional_layout(fab, geo, counts)
+    if kind == "family":
+        return family_layout(fab, geo, counts)
     if kind == "spread":
         return spread_layout(fab, geo, counts)
     if kind == "random":

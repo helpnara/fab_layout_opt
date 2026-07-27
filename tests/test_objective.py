@@ -63,6 +63,19 @@ def test_cost_model_source_flags_placeholder() -> None:
     assert "자리표시자" in CostModel().source
 
 
+def test_unknown_group_price_is_an_error() -> None:
+    """단가가 없는 설비를 0원으로 처리하면 예산 제약이 조용히 무력해진다.
+
+    실제로 중규모 데이터셋을 추가했을 때 세분된 그룹이 표에 없어 설비 대부분이
+    공짜로 계산됐다.
+    """
+    m = CostModel()
+    with pytest.raises(KeyError, match="단가가 없다"):
+        m.price("NO_SUCH_TOOL")
+    with pytest.raises(KeyError):
+        m.tool_capex({"NO_SUCH_TOOL": 2})
+
+
 # =========================================================================
 # 지속 가능성 판정
 # =========================================================================
