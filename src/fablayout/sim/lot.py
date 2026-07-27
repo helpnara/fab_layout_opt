@@ -15,7 +15,7 @@ class Lot:
         "lot_id", "pid", "route", "process_times",
         "step", "release_time", "done_time",
         "queue_minutes", "process_minutes", "transport_minutes",
-        "_step_enqueued",
+        "dest_bay", "_step_enqueued",
     )
 
     def __init__(
@@ -37,6 +37,8 @@ class Lot:
         self.queue_minutes = 0.0
         self.process_minutes = 0.0
         self.transport_minutes = 0.0
+        self.dest_bay = 0
+        """반송차가 내려놓을 bay. 도착 후에는 그 bay의 설비만 이 lot을 처리한다."""
         self._step_enqueued = release_time
 
     @property

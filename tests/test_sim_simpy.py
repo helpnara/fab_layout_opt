@@ -16,9 +16,9 @@
 from __future__ import annotations
 
 import pytest
-from conftest import make_fab
+from conftest import m2_config, make_fab
 
-from fablayout.sim import SimConfig, simulate
+from fablayout.sim import simulate
 
 simpy = pytest.importorskip("simpy", reason="SimPy는 개발 의존성이다")
 
@@ -67,7 +67,7 @@ def _own_completion_times(
 ) -> list[float]:
     """자체 엔진에서 lot별 완료 시각을 뽑는다."""
     fab = make_fab(groups, route, cv=0.0)
-    cfg = SimConfig(
+    cfg = m2_config(
         release_lots_per_day=1440.0 / gap,
         warmup_days=0.0,
         run_days=10_000.0,
@@ -78,15 +78,13 @@ def _own_completion_times(
 
     sim = Simulation(fab, cfg)
     finished: list[float] = []
-    original = sim._finish_step
+    original = sim._complete
 
-    def spy(payload):
-        lot = payload[2]
-        original(payload)
-        if lot.done:
-            finished.append(lot.done_time)
+    def spy(lot):
+        original(lot)
+        finished.append(lot.done_time)
 
-    sim._finish_step = spy  # type: ignore[method-assign]
+    sim._complete = spy  # type: ignore[method-assign]
     sim.run()
     return sorted(finished)
 
@@ -129,7 +127,7 @@ def test_aggregate_metrics_match_simpy() -> None:
     simpy_mean_ct = sum(d - r for d, r in zip(theirs, releases)) / N_LOTS
 
     fab = make_fab(GROUPS, ROUTE, cv=0.0)
-    r = simulate(fab, SimConfig(
+    r = simulate(fab, m2_config(
         release_lots_per_day=1440.0 / GAP,
         warmup_days=0.0,
         run_days=10_000.0,

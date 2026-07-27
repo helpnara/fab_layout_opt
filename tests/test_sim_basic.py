@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import pytest
-from conftest import make_fab
+from conftest import m2_config, make_fab
 
 from fablayout.core.analysis import analytic_capacity
 from fablayout.data.builtin import build_smallfab21
@@ -117,15 +117,15 @@ def test_low_load_x_factor_approaches_one() -> None:
     """저부하에서는 대기가 없어 사이클타임이 순수 처리시간에 수렴한다."""
     fab = build_smallfab21()
     cap = analytic_capacity(fab, batching=False).capacity_lots_per_day
-    r = simulate(fab, SimConfig(release_lots_per_day=cap * 0.35, warmup_days=40, run_days=200))
+    r = simulate(fab, m2_config(release_lots_per_day=cap * 0.35, warmup_days=40, run_days=200))
     assert 1.0 <= r.x_factor <= 1.15, f"X-factor {r.x_factor:.3f}"
 
 
 def test_x_factor_grows_with_load() -> None:
     fab = build_smallfab21()
     cap = analytic_capacity(fab, batching=False).capacity_lots_per_day
-    lo = simulate(fab, SimConfig(release_lots_per_day=cap * 0.4, warmup_days=40, run_days=200))
-    hi = simulate(fab, SimConfig(release_lots_per_day=cap * 0.9, warmup_days=40, run_days=200))
+    lo = simulate(fab, m2_config(release_lots_per_day=cap * 0.4, warmup_days=40, run_days=200))
+    hi = simulate(fab, m2_config(release_lots_per_day=cap * 0.9, warmup_days=40, run_days=200))
     assert hi.x_factor > lo.x_factor
     assert hi.mean_wip > lo.mean_wip
 
@@ -141,7 +141,7 @@ def test_des_never_exceeds_analytic_capacity() -> None:
     """
     fab = build_smallfab21()
     cap = analytic_capacity(fab, batching=False).capacity_lots_per_day
-    r = simulate(fab, SimConfig(release_lots_per_day=cap * 3, warmup_days=40, run_days=200))
+    r = simulate(fab, m2_config(release_lots_per_day=cap * 3, warmup_days=40, run_days=200))
     assert r.throughput_lots_per_day <= cap * 1.001, (
         f"실측 {r.throughput_lots_per_day:.3f} > 상한 {cap:.3f}"
     )
@@ -150,7 +150,7 @@ def test_des_never_exceeds_analytic_capacity() -> None:
 def test_utilization_never_exceeds_one() -> None:
     fab = build_smallfab21()
     cap = analytic_capacity(fab, batching=False).capacity_lots_per_day
-    r = simulate(fab, SimConfig(release_lots_per_day=cap * 2, warmup_days=40, run_days=120))
+    r = simulate(fab, m2_config(release_lots_per_day=cap * 2, warmup_days=40, run_days=120))
     for gid, u in r.utilizations().items():
         assert 0.0 <= u <= 1.0 + 1e-9, f"{gid} 가동률 {u}"
 
@@ -159,7 +159,7 @@ def test_bottleneck_matches_analytic() -> None:
     """DES가 지목하는 병목이 해석적 계산과 일치해야 한다."""
     fab = build_smallfab21()
     rep = analytic_capacity(fab, batching=False)
-    r = simulate(fab, SimConfig(release_lots_per_day=rep.capacity_lots_per_day * 0.9,
+    r = simulate(fab, m2_config(release_lots_per_day=rep.capacity_lots_per_day * 0.9,
                                 warmup_days=40, run_days=200))
     assert r.bottlenecks(1)[0][0] == rep.bottleneck.gid
 
@@ -169,7 +169,7 @@ def test_bottleneck_matches_analytic() -> None:
 
 def test_same_seed_gives_identical_results() -> None:
     fab = build_smallfab21()
-    cfg = SimConfig(release_lots_per_day=1.0, warmup_days=10, run_days=60)
+    cfg = m2_config(release_lots_per_day=1.0, warmup_days=10, run_days=60)
     a, b = simulate(fab, cfg), simulate(fab, cfg)
     assert a.cycle_times == b.cycle_times
     assert a.completions_in_window == b.completions_in_window
@@ -181,7 +181,7 @@ def test_different_seed_gives_different_results() -> None:
     from dataclasses import replace
 
     fab = build_smallfab21()
-    cfg = SimConfig(release_lots_per_day=1.0, warmup_days=10, run_days=60)
+    cfg = m2_config(release_lots_per_day=1.0, warmup_days=10, run_days=60)
     a = simulate(fab, cfg)
     b = simulate(fab, replace(cfg, seed=cfg.seed + 1))
     assert a.cycle_times != b.cycle_times
@@ -324,7 +324,7 @@ def test_engine_throughput_regression() -> None:
     """
     fab = build_smallfab21()
     cap = analytic_capacity(fab, batching=False).capacity_lots_per_day
-    r = simulate(fab, SimConfig(release_lots_per_day=cap * 0.9,
+    r = simulate(fab, m2_config(release_lots_per_day=cap * 0.9,
                                 warmup_days=30, run_days=600))
     assert r.events > 5000, "측정 표본이 너무 작다"
     rate = r.events / r.wall_seconds

@@ -68,21 +68,75 @@ class GroupMetrics:
     tools: int
     busy_minutes: float = 0.0
     """관측 창 안의 총 설비 점유 시간 (모든 설비 합)."""
+    down_minutes: float = 0.0
+    """고장으로 멈춰 있던 시간 합."""
     queue_minutes: float = 0.0
     """관측 창 안에 큐에 들어간 lot들의 대기시간 합."""
     queue_entries: int = 0
     starts: int = 0
+    """착수한 lot 수 (배치면 구성원 수 합)."""
+    batches: int = 0
+    """착수 횟수. 단일 설비면 starts와 같다."""
+    partial_batches: int = 0
+    """배치가 다 차지 않은 채 타임아웃으로 착수한 횟수."""
+    failures: int = 0
     mean_queue_len: float = 0.0
     peak_queue_len: float = 0.0
 
     def utilization(self, window_minutes: float) -> float:
-        """설비 가동률 = 점유시간 / (대수 × 창 길이)."""
+        """설비 가동률 = 점유시간 / (대수 × 창 길이).
+
+        분모가 달력시간이므로 고장으로 멈춘 시간도 분모에 포함된다. 즉 이 값은
+        "설비가 실제로 일한 비율"이고, 고장을 감안한 실효 능력 대비 부하는
+        `load_factor`가 나타낸다.
+        """
         cap = self.tools * window_minutes
         return self.busy_minutes / cap if cap > 0 else 0.0
+
+    def availability(self, window_minutes: float) -> float:
+        """가동 가능했던 시간 비율 = 1 − 고장시간 / (대수 × 창 길이)."""
+        cap = self.tools * window_minutes
+        return 1.0 - self.down_minutes / cap if cap > 0 else 1.0
+
+    def load_factor(self, window_minutes: float) -> float:
+        """가동 가능 시간 대비 점유 비율. 1에 가까우면 실질 병목이다."""
+        cap = self.tools * window_minutes - self.down_minutes
+        return self.busy_minutes / cap if cap > 0 else 0.0
+
+    @property
+    def mean_batch_size(self) -> float:
+        return self.starts / self.batches if self.batches else 0.0
 
     @property
     def mean_queue_wait(self) -> float:
         return self.queue_minutes / self.queue_entries if self.queue_entries else 0.0
+
+
+@dataclass
+class TransportMetrics:
+    """반송 시스템 지표."""
+
+    vehicles: int
+    busy_minutes: float = 0.0
+    wait_minutes: float = 0.0
+    """반송차를 기다린 시간 합 (반송차가 모자라 생긴 지연)."""
+    moves: int = 0
+    queued_moves: int = 0
+    """즉시 배정받지 못하고 대기해야 했던 요청 수."""
+    stocker_ops: int = 0
+    distance_m: float = 0.0
+
+    def utilization(self, window_minutes: float) -> float:
+        cap = self.vehicles * window_minutes
+        return self.busy_minutes / cap if cap > 0 else 0.0
+
+    @property
+    def mean_wait_minutes(self) -> float:
+        return self.wait_minutes / self.moves if self.moves else 0.0
+
+    @property
+    def queued_fraction(self) -> float:
+        return self.queued_moves / self.moves if self.moves else 0.0
 
 
 @dataclass
@@ -101,7 +155,9 @@ class SimResult:
     """창 안에 완료된 lot 수 (투입 시각 무관). 처리량의 분자."""
     cycle_times: list[float] = field(default_factory=list)
     raw_process_minutes: list[float] = field(default_factory=list)
+    transport_minutes: list[float] = field(default_factory=list)
     groups: dict[str, GroupMetrics] = field(default_factory=dict)
+    transport: "TransportMetrics | None" = None
     mean_wip: float = 0.0
     peak_wip: float = 0.0
     wafers_per_lot: int = 25
@@ -140,6 +196,17 @@ class SimResult:
         return _mean(self.raw_process_minutes) / 60.0
 
     @property
+    def mean_transport_hours(self) -> float:
+        """lot 1개가 반송에 쓴 시간 (반송차 대기 포함)."""
+        return _mean(self.transport_minutes) / 60.0
+
+    @property
+    def transport_share(self) -> float:
+        """사이클타임 중 반송이 차지하는 비율."""
+        ct = _mean(self.cycle_times)
+        return _mean(self.transport_minutes) / ct if ct > 0 else 0.0
+
+    @property
     def x_factor(self) -> float:
         """사이클타임 ÷ 순수 처리시간. 1.0이면 대기가 전혀 없다는 뜻."""
         raw = _mean(self.raw_process_minutes)
@@ -152,6 +219,15 @@ class SimResult:
             gid: g.utilization(self.window_minutes) for gid, g in self.groups.items()
         }
 
+    def load_factors(self) -> dict[str, float]:
+        return {
+            gid: g.load_factor(self.window_minutes) for gid, g in self.groups.items()
+        }
+
+    @property
+    def vehicle_utilization(self) -> float:
+        return self.transport.utilization(self.window_minutes) if self.transport else 0.0
+
     def bottlenecks(self, top: int = 3) -> list[tuple[str, float]]:
         u = self.utilizations()
         return sorted(u.items(), key=lambda kv: -kv[1])[:top]
@@ -163,12 +239,16 @@ class SimResult:
 
     def summary(self) -> str:  # pragma: no cover - 사람이 읽는 요약
         b = ", ".join(f"{g} {u:.0%}" for g, u in self.bottlenecks())
+        t = ""
+        if self.transport:
+            t = (f" · 반송차 {self.vehicle_utilization:.0%}"
+                 f"(대기 {self.transport.mean_wait_minutes:.1f}분)")
         return (
             f"처리량 {self.throughput_lots_per_day:.2f} lot/일 "
             f"({self.throughput_wafers_per_day:.0f} 웨이퍼/일) · "
             f"사이클타임 {self.mean_cycle_hours:.1f}h (p95 {self.p95_cycle_hours:.1f}h) · "
             f"X-factor {self.x_factor:.2f} · WIP {self.mean_wip:.1f} · "
-            f"가동률 상위 [{b}] · 표본 {self.completed}개(미완료 {self.censored}) · "
+            f"가동률 상위 [{b}]{t} · 표본 {self.completed}개 · "
             f"이벤트 {self.events:,}개 / {self.wall_seconds:.2f}s"
         )
 

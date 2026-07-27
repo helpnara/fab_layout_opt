@@ -524,6 +524,8 @@ def deviation_svg(
     rows: list[tuple[str, float, float, float]],
     title: str = "대기행렬 이론과의 대조",
     subtitle: str = "",
+    legend: str = "점 = 이론값 대비 편차 · 회색 띠 = 허용오차 · 세로선 = 완전 일치",
+    mark_status: bool = True,
     width: float = 720,
     row_h: float = 34,
 ) -> str:
@@ -546,8 +548,7 @@ def deviation_svg(
     s.text(16, 22, title, size=14, weight="600")
     if subtitle:
         s.text(16, 39, subtitle, size=10, fill=INK2)
-    s.text(16, 56, "점 = 이론값 대비 편차 · 회색 띠 = 허용오차 · 세로선 = 완전 일치",
-           size=9.5, fill=INK3)
+    s.text(16, 56, legend, size=9.5, fill=INK3)
 
     for i, (label, measured, theory, tol) in enumerate(rows):
         y = top + i * row_h + row_h / 2
@@ -558,10 +559,13 @@ def deviation_svg(
         s.text(left - 10, y + 4, label, size=10, fill=INK, anchor="end")
         s.line(px(0), y - 11, px(0), y + 11, stroke=INK3, sw=1)
         s.line(px(0), y, px(dev), y, stroke=INK3, sw=1.5)
+        # 상태색(초록/빨강)은 "합격/불합격"으로 읽힌다. 그 해석이 맞는 도표에서만 쓰고,
+        # 단순 비교에서는 중립 단색을 쓴다.
+        dot = (GOOD if ok else CRITICAL) if mark_status else SEQ[4]
         s.add(f'<circle cx="{_n(px(dev))}" cy="{_n(y)}" r="5.5" '
-              f'fill="{GOOD if ok else CRITICAL}" stroke="{SURFACE}" stroke-width="1.5">'
-              f'<title>{_e(label)} — 실측 {measured:.2f} vs 이론 {theory:.2f} '
-              f'({dev:+.1%}, 허용 ±{tol:.0%})</title></circle>')
+              f'fill="{dot}" stroke="{SURFACE}" stroke-width="1.5">'
+              f'<title>{_e(label)} — {measured:.2f} vs 기준 {theory:.2f} '
+              f'({dev:+.1%})</title></circle>')
         s.text(left + plot_w + 8, y + 4, f"{dev:+.1%}", size=10,
                fill=INK, weight="600")
 
@@ -569,6 +573,83 @@ def deviation_svg(
     s.text(px(0), ay, "0", size=9, fill=INK3, anchor="middle")
     s.text(px(-span), ay, f"{-span:+.0%}", size=9, fill=INK3, anchor="middle")
     s.text(px(span), ay, f"{span:+.0%}", size=9, fill=INK3, anchor="middle")
+    return s.render()
+
+
+# =========================================================================
+# 배치안 비교 (지표별 패널)
+# =========================================================================
+
+
+def paired_bars_svg(
+    rows: list[tuple[str, float, float, float, float]],
+    left: tuple[str, str],
+    right: tuple[str, str],
+    title: str = "",
+    subtitle: str = "",
+    width: float = 720,
+    row_h: float = 38,
+) -> str:
+    """(범주, 좌측값, 좌측오차, 우측값, 우측오차)를 **패널 두 개**로 나눠 그린다.
+
+    같은 범주에 대한 서로 다른 지표를 한 축에 겹치면 안 된다(이중축 금지). 척도가
+    다르면 값들이 뭉개져 비교가 불가능해지기도 한다 — 처리량 5.93과 사이클타임 241을
+    같은 축에 놓으면 처리량 쪽 점들이 한 점으로 겹친다.
+
+    막대는 0에서 시작한다. "차이가 없다"를 보여야 할 때 축을 잘라 확대하면 없는 차이를
+    만들어내기 때문이다. 오차막대는 95% 신뢰구간이다.
+
+    `left`/`right`는 (패널 제목, 단위).
+    """
+    label_w, gap, pad = 92.0, 34.0, 20.0
+    top = 74.0 if subtitle else 58.0
+    panel_w = (width - label_w - gap - pad * 2 - 52) / 2
+    H = top + len(rows) * row_h + 46
+
+    s = _Svg(width, H, [], aria=title or "배치안 비교")
+    s.rect(0, 0, width, H, fill=SURFACE)
+    if title:
+        s.text(16, 22, title, size=14, weight="600")
+    if subtitle:
+        s.text(16, 39, subtitle, size=10, fill=INK2)
+
+    def panel(x0: float, name: str, unit: str, idx: int) -> None:
+        vals = [r[1 + idx * 2] + r[2 + idx * 2] for r in rows]
+        hi = max(vals) * 1.16
+        s.text(x0, top - 12, name, size=10.5, fill=INK, weight="600")
+        for k in range(3):
+            v = hi * k / 2
+            gx = x0 + panel_w * k / 2
+            s.line(gx, top - 4, gx, top + len(rows) * row_h - 8, stroke=GRID, sw=1)
+            s.text(gx, top + len(rows) * row_h + 10, f"{v:.0f}", size=9,
+                   fill=INK3, anchor="middle")
+        s.text(x0 + panel_w / 2, top + len(rows) * row_h + 26, unit, size=9,
+               fill=INK2, anchor="middle")
+        for i, r in enumerate(rows):
+            v, e = r[1 + idx * 2], r[2 + idx * 2]
+            y = top + i * row_h
+            bh = row_h - 16
+            w = panel_w * v / hi
+            s.rect(x0, y, w, bh, fill=SEQ[4], rx=3,
+                   title=f"{r[0]} — {v:.2f} ± {e:.2f}{unit}")
+            if e > 0:
+                ex0, ex1 = x0 + panel_w * (v - e) / hi, x0 + panel_w * (v + e) / hi
+                cy = y + bh / 2
+                s.line(ex0, cy, ex1, cy, stroke=INK, sw=1.2)
+                s.line(ex0, cy - 4, ex0, cy + 4, stroke=INK, sw=1.2)
+                s.line(ex1, cy - 4, ex1, cy + 4, stroke=INK, sw=1.2)
+            s.text(x0 + panel_w + 6, y + bh / 2 + 4,
+                   f"{v:.2f}" if v < 100 else f"{v:.0f}", size=10, fill=INK)
+
+    for i, r in enumerate(rows):
+        y = top + i * row_h
+        s.text(label_w - 10, y + (row_h - 16) / 2 + 4, r[0], size=10.5,
+               fill=INK, anchor="end", weight="600")
+
+    panel(label_w, left[0], left[1], 0)
+    panel(label_w + panel_w + gap + 52, right[0], right[1], 1)
+    s.text(16, H - 12, "막대는 0에서 시작 · 검은 선 = 95% 신뢰구간 "
+                       "(겹치면 차이가 유의하지 않다)", size=9, fill=INK3)
     return s.render()
 
 

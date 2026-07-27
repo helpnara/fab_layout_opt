@@ -17,9 +17,9 @@ E[S²] = (cv² + 1)·E[S]² 이므로, cv가 커질수록 같은 가동률에서
 from __future__ import annotations
 
 import pytest
-from conftest import single_server_fab
+from conftest import m2_config, single_server_fab
 
-from fablayout.sim import SimConfig, simulate
+from fablayout.sim import simulate
 from fablayout.sim.rng import lognormal_second_moment
 
 
@@ -34,7 +34,7 @@ def pk_waiting_minutes(lam_per_min: float, mean_s: float, cv: float) -> float:
 def _measure_wait(mean_s: float, cv: float, rho: float, days: float, seed: int) -> float:
     lam = rho / mean_s                       # lot/분
     fab = single_server_fab(mean_s, cv)
-    r = simulate(fab, SimConfig(
+    r = simulate(fab, m2_config(
         release_lots_per_day=lam * 1440.0,
         warmup_days=days * 0.15,
         run_days=days,
@@ -85,7 +85,7 @@ def test_utilization_matches_rho() -> None:
     """실측 가동률이 이론 ρ = λ·E[S]와 맞아야 한다."""
     mean_s, rho = 60.0, 0.75
     fab = single_server_fab(mean_s, cv=0.3)
-    r = simulate(fab, SimConfig(
+    r = simulate(fab, m2_config(
         release_lots_per_day=(rho / mean_s) * 1440.0,
         warmup_days=60, run_days=600, seed=5,
     ))
@@ -96,7 +96,7 @@ def test_littles_law() -> None:
     """리틀의 법칙: WIP = 처리량 × 사이클타임. 지표 집계의 내적 정합성 검증."""
     mean_s, rho = 60.0, 0.7
     fab = single_server_fab(mean_s, cv=0.4)
-    r = simulate(fab, SimConfig(
+    r = simulate(fab, m2_config(
         release_lots_per_day=(rho / mean_s) * 1440.0,
         warmup_days=60, run_days=900, seed=3,
     ))
