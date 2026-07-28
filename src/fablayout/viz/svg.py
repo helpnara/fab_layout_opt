@@ -189,7 +189,11 @@ def layout_svg(
     hi_load = max(bay_load.values()) or 1.0
 
     pad_x, pad_top, label_h = 46.0, 22.0 + (26 if title else 0), 52.0
-    legend_h = 84.0
+    # 약호표의 행 수는 그룹 수에 따라 달라진다. 2행으로 고정하면 그룹이 많은 데이터셋
+    # (midfab 18개)에서 마지막 행이 아래 기호 설명과 겹친다.
+    legend_cols = 6
+    legend_rows = -(-len(codes) // legend_cols)
+    legend_h = 16.0 + legend_rows * 15.0 + 34.0
     plot_w = (x1 - x0) * scale
     W = max(plot_w + pad_x * 2, 660.0)
     H = pad_top + label_h + (y1 * 2) * scale + label_h + legend_h
@@ -292,15 +296,14 @@ def layout_svg(
     lx0 = pad_x - 30
     ly0 = H - legend_h + 16
     s.text(lx0, ly0, "약호", size=9, fill=INK2, weight="600")
-    per_row = 6
-    col_w = (W - lx0 - pad_x + 30 - 34) / per_row
+    col_w = (W - lx0 - pad_x + 30 - 34) / legend_cols
     for i, (gid, code) in enumerate(codes.items()):
-        gx = lx0 + 34 + (i % per_row) * col_w
-        gy = ly0 + (i // per_row) * 15
+        gx = lx0 + 34 + (i % legend_cols) * col_w
+        gy = ly0 + (i // legend_cols) * 15
         s.text(gx, gy, code, size=9, fill=INK, weight="700")
         # 괄호 부연은 떼고 핵심 명칭만 — 좁은 칸에서 단어 중간이 잘리는 것을 막는다
         s.text(gx + 20, gy, fab.groups[gid].name.split(" (")[0], size=9, fill=INK3)
-    sy = ly0 + 38
+    sy = ly0 + legend_rows * 15 + 8
     s.line(lx0, sy - 12, W - pad_x + 30, sy - 12, stroke=GRID, sw=1)
     s.text(lx0, sy + 2,
            "상단 굵은선 = 배치 설비  ·  점선 = bay 중앙 궤도  ·  "
@@ -534,7 +537,12 @@ def deviation_svg(
     "맞았는가"를 보는 데는 두 값을 나란히 놓은 막대보다 **0을 기준으로 한 편차**가
     낫다. 허용오차 띠 안에 점이 들어왔는지가 한눈에 보인다.
     """
-    left, right, top = 168.0, 96.0, 74.0
+    # 라벨 폭은 내용에서 잰다. 고정하면 긴 라벨(대수 재구성 구성명)이 왼쪽에서 잘린다.
+    def _text_w(t: str) -> float:
+        return sum(10.0 if ord(c) > 0x2E80 else 5.6 for c in t)
+
+    left = min(max(168.0, max(_text_w(r[0]) for r in rows) + 22.0), width * 0.45)
+    right, top = 96.0, 74.0
     H = top + len(rows) * row_h + 44
     plot_w = width - left - right
     span = max(max(abs(m / t - 1.0) for _, m, t, _ in rows),
@@ -839,4 +847,161 @@ def distance_heatmap_svg(
     for i, c in enumerate(SEQ):
         s.rect(left + 24 + i * 16, ly - 9, 14, 10, fill=c, stroke=LINE, sw=0.5)
     s.text(left + 24 + bins * 16 + 4, ly, f"{hi:.0f}m", size=9, fill=INK3)
+    return s.render()
+
+
+# =========================================================================
+# 사이클타임 분해
+# =========================================================================
+
+
+def composition_svg(
+    parts: list[tuple[str, float, str]],
+    title: str = "",
+    subtitle: str = "",
+    unit: str = "h",
+    width: float = 720,
+    highlight: int = -1,
+) -> str:
+    """전체를 100%로 놓고 구성 항을 가로로 쌓는다. (이름, 값, 주석)
+
+    비중 자체가 논지일 때 쓴다 — "배치가 손댈 수 있는 것은 반송 항뿐이므로 그 비중이
+    최적화의 천장이다"처럼. `highlight`로 지목한 항만 강조색으로 칠하고 나머지는
+    순차 팔레트의 옅은 쪽에 둔다. 범주 색을 4개 쓰는 것보다 논지가 선명하다.
+    """
+    left, right = 16.0, 16.0
+    top = 74.0 if subtitle else 58.0
+    bar_h = 34.0
+    plot_w = width - left - right
+    total = sum(v for _, v, _ in parts) or 1.0
+    H = top + bar_h + 34 + len(parts) * 20 + 14
+
+    s = _Svg(width, H, [], aria=title or "구성 분해")
+    s.rect(0, 0, width, H, fill=SURFACE)
+    if title:
+        s.text(16, 22, title, size=14, weight="600")
+    if subtitle:
+        s.text(16, 39, subtitle, size=10, fill=INK2)
+
+    x = left
+    for i, (name, v, _) in enumerate(parts):
+        w = plot_w * v / total
+        fill = CRITICAL if i == highlight else SEQ[1 + min(i, 3)]
+        s.rect(x, top, max(w - 2, 0), bar_h, fill=fill, rx=3,
+               title=f"{name} {v:.1f}{unit} ({v / total:.1%})")
+        if w > 52:
+            s.text(x + w / 2 - 1, top + bar_h / 2 + 4, f"{v / total:.0%}",
+                   size=11, fill=SURFACE if i >= 2 or i == highlight else INK,
+                   anchor="middle", weight="700")
+        x += w
+
+    # 값 눈금 대신 직접 라벨 — 항이 서너 개뿐이라 축보다 목록이 읽기 쉽다
+    ly = top + bar_h + 26
+    for i, (name, v, note) in enumerate(parts):
+        fill = CRITICAL if i == highlight else SEQ[1 + min(i, 3)]
+        s.rect(16, ly - 8, 10, 10, fill=fill, rx=2)
+        s.text(32, ly + 1, name, size=10.5, fill=INK,
+               weight="700" if i == highlight else "600")
+        s.text(150, ly + 1, f"{v:.1f}{unit}", size=10.5, fill=INK, anchor="end")
+        s.text(196, ly + 1, f"{v / total:.1%}", size=10.5, fill=INK2, anchor="end")
+        s.text(210, ly + 1, note, size=9.5, fill=INK3)
+        ly += 20
+    s.text(16, H - 10, f"합계 {total:.1f}{unit}", size=9.5, fill=INK2)
+    return s.render()
+
+
+# =========================================================================
+# 대리지표 게이트 (산점도)
+# =========================================================================
+
+_MARKS = ("circle", "square", "triangle", "diamond")
+
+
+def _mark(s: _Svg, kind: str, x: float, y: float, r: float, fill: str,
+          title: str) -> None:
+    t = f"<title>{_e(title)}</title>"
+    stroke = f'stroke="{SURFACE}" stroke-width="1.2"'
+    if kind == "circle":
+        s.add(f'<circle cx="{_n(x)}" cy="{_n(y)}" r="{_n(r)}" fill="{fill}" {stroke}>{t}</circle>')
+    elif kind == "square":
+        s.add(f'<rect x="{_n(x - r)}" y="{_n(y - r)}" width="{_n(2 * r)}" '
+              f'height="{_n(2 * r)}" fill="{fill}" {stroke}>{t}</rect>')
+    elif kind == "triangle":
+        pts = f"{_n(x)},{_n(y - r * 1.2)} {_n(x - r * 1.1)},{_n(y + r * 0.9)} " \
+              f"{_n(x + r * 1.1)},{_n(y + r * 0.9)}"
+        s.add(f'<polygon points="{pts}" fill="{fill}" {stroke}>{t}</polygon>')
+    else:
+        pts = f"{_n(x)},{_n(y - r * 1.3)} {_n(x + r * 1.3)},{_n(y)} " \
+              f"{_n(x)},{_n(y + r * 1.3)} {_n(x - r * 1.3)},{_n(y)}"
+        s.add(f'<polygon points="{pts}" fill="{fill}" {stroke}>{t}</polygon>')
+
+
+def scatter_svg(
+    points: list[tuple[float, float, str, int]],
+    series: list[str],
+    title: str = "",
+    subtitle: str = "",
+    x_label: str = "",
+    y_label: str = "",
+    note: str = "",
+    width: float = 720,
+    height: float = 400,
+) -> str:
+    """(x, y, 라벨, 계열번호) 산점도. 계열은 색과 **모양**으로 함께 구분한다.
+
+    색만으로 구분하면 색각 이상에서 계열이 뭉친다. 계열이 넷이라 모양을 병행하는
+    비용이 작으므로 둘 다 쓴다.
+    """
+    # 제목·부제 아래에 y축 라벨과 범례가 각각 한 줄씩 더 들어간다. 74로 두면 넷이 겹친다.
+    left, right, top = 62.0, 20.0, 104.0 if subtitle else 88.0
+    bottom = 58.0 + (16.0 if note else 0.0)
+    plot_w, plot_h = width - left - right, height - top - bottom
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+    x0, x1 = min(xs), max(xs)
+    y0, y1 = min(ys), max(ys)
+    xpad, ypad = (x1 - x0) * 0.08 or 1.0, (y1 - y0) * 0.10 or 1.0
+    x0, x1 = x0 - xpad, x1 + xpad
+    y0, y1 = y0 - ypad, y1 + ypad
+
+    def px(v: float) -> float:
+        return left + plot_w * (v - x0) / (x1 - x0)
+
+    def py(v: float) -> float:
+        return top + plot_h - plot_h * (v - y0) / (y1 - y0)
+
+    s = _Svg(width, height, [], aria=title or "대리지표 대 실측")
+    s.rect(0, 0, width, height, fill=SURFACE)
+    if title:
+        s.text(16, 22, title, size=14, weight="600")
+    if subtitle:
+        s.text(16, 39, subtitle, size=10, fill=INK2)
+
+    for k in range(5):
+        gy = top + plot_h * k / 4
+        s.line(left, gy, left + plot_w, gy, stroke=GRID, sw=1)
+        s.text(left - 8, gy + 4, f"{y1 - (y1 - y0) * k / 4:.0f}", size=9,
+               fill=INK3, anchor="end")
+    for k in range(5):
+        gx = left + plot_w * k / 4
+        s.line(gx, top + plot_h, gx, top + plot_h + 5, stroke=LINE, sw=1)
+        s.text(gx, top + plot_h + 18, f"{x0 + (x1 - x0) * k / 4:.0f}", size=9,
+               fill=INK3, anchor="middle")
+    s.line(left, top + plot_h, left + plot_w, top + plot_h, stroke=LINE, sw=1)
+
+    for x, y, label, si in points:
+        _mark(s, _MARKS[si % len(_MARKS)], px(x), py(y), 5.0,
+              CAT[si % len(CAT)], f"{label} — 대리지표 {x:.0f}, 실측 {y:.1f}h")
+
+    lx = left
+    for i, name in enumerate(series):
+        _mark(s, _MARKS[i % len(_MARKS)], lx + 5, top - 14, 4.5, CAT[i % len(CAT)], name)
+        s.text(lx + 14, top - 10, name, size=9.5, fill=INK2)
+        lx += 22 + len(name) * 9.5
+
+    s.text(left + plot_w / 2, height - (26 if note else 12), x_label, size=10,
+           fill=INK2, anchor="middle")
+    s.text(16, top - 34, y_label, size=10, fill=INK2)
+    if note:
+        s.text(16, height - 10, note, size=9.5, fill=INK3)
     return s.render()

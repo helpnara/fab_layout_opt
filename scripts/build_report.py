@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import subprocess
 import sys
 import time
@@ -34,8 +35,8 @@ MILESTONES = [
     ("M2", "DES 엔진 기본", "done"),
     ("M3", "고장 · 배치 · 반송", "done"),
     ("M4", "목표함수 · 능력탐색 · CLI", "done"),
-    ("M5", "대리지표 상관 검증", "gate next"),
-    ("M6", "SA · 2단 파이프라인", "todo"),
+    ("M5", "탐색공간 확대 · 대리지표 게이트", "done"),
+    ("M6", "대수 구성 최적화기", "gate next"),
     ("M7", "FastAPI · 배치도 UI", "todo"),
     ("M8", "비교 · 애니메이션", "todo"),
 ]
@@ -283,6 +284,24 @@ def _pct(x: float) -> str:
     return f"{x * 100:.0f}%"
 
 
+RESULTS = Path(__file__).resolve().parents[1] / "results"
+
+
+def _load(name: str, script: str) -> dict:
+    """실험 결과 JSON을 읽는다.
+
+    M5의 측정은 `midfab`에서 DES를 수십 회 돌리므로 리포트 생성 중에 다시 계산하기에는
+    너무 비싸다(약 10분). 실험 스크립트가 결과를 남기고 리포트는 그것을 읽는다 —
+    숫자의 출처는 여전히 커밋된 스크립트이고, 생성 시각이 JSON에 함께 남는다.
+    """
+    path = RESULTS / name
+    if not path.exists():
+        raise SystemExit(
+            f"{path}가 없다. 먼저 실행할 것:\n  python {script} --out results/{name}"
+        )
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
 def build() -> str:
     fab = build_smallfab21()
     geo = default_geometry()
@@ -512,6 +531,65 @@ def build() -> str:
         v = check_stability(rr, rate, 60, 180)
         stability_rows.append((f"부하 {frac:.0%}", v.throughput_ratio, 1.0, 0.05))
 
+    # ---- M5: 탐색공간 확대 (실험 결과 JSON) ---------------------------
+    space = _load("midfab_space.json", "scripts/expand_space.py")
+    calib = _load("surrogate_calibration.json", "scripts/calibrate_surrogate.py")
+
+    from fablayout.data.midfab import build_midfab, midfab_geometry  # noqa: E402
+
+    mfab, mgeo = build_midfab(), midfab_geometry()
+    mid_family = baseline.family_layout(mfab, mgeo)
+    mid_tools = mfab.total_tools
+    mid_track_visits = mfab.weighted_visits()["TRACK"]
+    small_scale, mid_scale = space["scale"][0], space["scale"][1]
+    dec = space["decomposition"]
+
+    # 게이트 산점도 — 구성 방식별로 계열을 나눈다 (색 + 모양)
+    _SERIES = ("구성 휴리스틱", "무작위", "교란", "담금질")
+
+    def _series_of(name: str) -> int:
+        if name.startswith("무작위"):
+            return 1
+        if name.startswith("교란"):
+            return 2
+        if name.startswith("담금질"):
+            return 3
+        return 0
+
+    cw = calib["weights"]
+    gate_series = list(_SERIES)
+    gate_points = [
+        (cw["stocker"] * r["stocker"] + cw["travel"] * r["travel"]
+         + cw["split"] * r["split"],
+         r["cycle_hours"], r["name"], _series_of(r["name"]))
+        for r in calib["rows"]
+    ]
+    term_span = {
+        k: max(r[k] for r in calib["rows"]) - min(r[k] for r in calib["rows"])
+        for k in ("stocker", "travel", "split")
+    }
+    term_contrib = {k: cw[k] * term_span[k] for k in term_span}
+    term_rho = calib["term_rho"]
+    _hours = [r["cycle_hours"] for r in calib["rows"]]
+    gate_lo, gate_hi = min(_hours), max(_hours)
+    gate_span = gate_hi - gate_lo
+    gate_mean_ci = sum(r["cycle_ci"] for r in calib["rows"]) / len(calib["rows"])
+
+    # 대수 재구성 — 기준선 대비 편차. 띠는 쌍대 신뢰구간.
+    base_hours = space["baseline"]["cycle_hours"]
+
+    def _short_desc(desc: str) -> str:
+        """도표 라벨은 **사는 쪽**만 적는다. 파는 쪽까지 적으면 라벨이 도표를 덮는다."""
+        buy, _, sell = desc.partition(" / ")
+        n_sell = len(sell.split()) if sell else 0
+        return f"{buy}  (매각 {n_sell}종)" if n_sell else buy
+
+    count_dev_rows = [
+        (_short_desc(r["desc"]), r["cycle_hours"], base_hours, r["ci"] / base_hours)
+        for r in space["counts"]
+    ]
+    best_count = space["counts"][0]
+
     tests = subprocess.run(
         [sys.executable, "-m", "pytest", "-q", "--no-header"],
         capture_output=True, text=True, cwd=Path(__file__).resolve().parents[1],
@@ -530,19 +608,20 @@ def build() -> str:
     a('<div class="wrap">')
     a('<header class="masthead">')
     a('<span class="eyebrow">fab_layout_opt · 진행 리포트</span>')
-    a("<h1>M4 완료 — 목표 함수 확정과 탐색공간 사전 점검</h1>")
-    a('<p class="dek">M3의 실측 결과에 따라 목표 함수를 <b>“capex 예산 제약 하에서 목표 '
-      "처리량을 만족하며 사이클타임 최소화”</b>로 확정했다. M4에서 그 목표 함수와 제약, "
-      "지속 가능성 판정, CLI를 구현하고, <b>최적화기를 만들기 전에 “이길 여지가 "
-      "있는가”를 먼저 측정했다</b>.</p>")
+    a("<h1>M5 완료 — 탐색공간을 키우고, 최적화 대상을 바꾸다</h1>")
+    a('<p class="dek">M4의 결론(“배치의 여지가 작다”)이 문제의 성질인지 데이터셋이 작아서인지 '
+      f"확인하기 위해 설비 {mid_tools}대·bay {len(mgeo.bays)}개 규모로 탐색공간을 키웠다. "
+      "결론은 같았고, 이유가 분명해졌다 — <b>사이클타임에서 반송이 차지하는 몫이 "
+      f"{dec['transport_hours'] / dec['cycle_hours']:.0%}뿐이라 배치의 천장이 거기까지다.</b> "
+      "대신 같은 예산 안의 <b>대수 재구성</b>이 훨씬 큰 레버임을 확인했다.</p>")
     a('<div class="meta">')
     a(f"<span>테스트 <b>{n_tests}개 통과</b></span>")
-    a(f"<span>설비 <b>{fab.total_tools}대</b> / slot <b>{geo.slot_count}</b></span>")
+    a(f"<span>midfab 설비 <b>{mid_tools}대</b> / slot <b>{mgeo.slot_count}</b></span>")
     a(f"<span>엔진 <b>{bench_rate:,.0f} 이벤트/초</b></span>")
-    a(f"<span>배치의 사이클타임 효과 <b>{layout_ct_gain:+.0%}</b></span>")
-    a(f"<span>기준선의 위치 <b>무작위 배치 상위 {base_percentile:.0%}</b></span>")
-    a(f"<span>최적화 여지 <b>{total_gain:+.1%}</b></span>")
-    a("<span>다음 <b>M5 · 대리지표 게이트</b></span>")
+    a(f"<span>배치의 천장 <b>{dec['transport_hours'] / dec['cycle_hours']:.1%}</b></span>")
+    a(f"<span>대수 재구성 <b>{best_count['gain']:+.1%}</b> (유의)</span>")
+    a(f"<span>대리지표 게이트 <b>ρ {calib['cv_rho']:+.2f} · 미달</b></span>")
+    a("<span>다음 <b>M6 · 대수 구성 최적화기</b></span>")
     a("</div></header>")
 
     # ---- 마일스톤 트랙
@@ -551,8 +630,9 @@ def build() -> str:
         a(f'<div class="stage {state}"><div class="id">{mid}</div>'
           f'<div class="nm">{name}</div></div>')
     a("</div>")
-    a('<p class="track-note">M5는 게이트다 — 거리 대리지표와 DES 실측의 순위상관이 '
-      "0.7 미만이면 2단 최적화 구조를 버리고 다른 접근으로 선회한다.</p>")
+    a('<p class="track-note">M5의 게이트(대리지표와 DES 실측의 순위상관 ρ ≥ 0.7)는 '
+      f"미달했다(ρ = {calib['cv_rho']:+.2f}). 그 이유와 대응이 §24다 — 대리지표는 "
+      "순위를 매기는 데는 못 쓰고 나쁜 배치를 거르는 데만 쓴다.</p>")
 
     a('<div class="mband"><span class="id">M1</span>'
       '<span class="nm">코어 모델 · 내장 데이터셋 · 거리 행렬</span>'
@@ -1239,45 +1319,300 @@ def build() -> str:
     a("</section>")
 
 
+    # =====================================================================
+    # M5 — 탐색공간 확대와 대리지표 게이트
+    # =====================================================================
+    a('<div class="mband"><span class="id">M5</span>'
+      '<span class="nm">탐색공간 확대 · 사이클타임 분해 · 대리지표 게이트</span>'
+      '<span class="sub">규모를 키워도 결론이 같은지 확인하다</span></div>')
+
+    # ---- 규모
+    a("<section>")
+    a('<span class="eyebrow">탐색공간 확대</span>')
+    a(f'<h2><span class="n">22</span>설비를 {mid_tools}대로 늘렸다</h2>')
+    a("<p class=\"lead\">M4의 결론(“배치의 여지가 작다”)이 <b>문제의 성질인지, "
+      "데이터셋이 작아서인지</b> 구분되지 않았다. 설비 21대·bay 5개는 배치 경우의 수 "
+      "자체가 좁다. 그래서 규모를 키운 <code>midfab</code>을 만들고 같은 질문을 다시 "
+      "던졌다.</p>")
+    a('<div class="tblwrap"><table>')
+    a("<thead><tr><th>항목</th><th>smallfab-21</th><th>midfab</th><th>배수</th></tr>"
+      "</thead><tbody>")
+    for label, key, fmt in (
+        ("설비 그룹", "groups", "{:.0f}"), ("설비 대수", "tools", "{:.0f}"),
+        ("제품", "products", "{:.0f}"), ("최장 라우트(스텝)", "max_steps", "{:.0f}"),
+        ("bay", "bays", "{:.0f}"), ("slot", "slots", "{:.0f}"),
+        ("spine 길이", "spine_m", "{:.0f}m"), ("capex", "capex", "{:.0f}"),
+        ("해석적 상한", "capacity", "{:.2f} lot/일"),
+    ):
+        s_v, m_v = small_scale[key], mid_scale[key]
+        a(f"<tr><td>{label}</td><td>{fmt.format(s_v)}</td><td>{fmt.format(m_v)}</td>"
+          f"<td>{m_v / s_v:.1f}×</td></tr>")
+    a("</tbody></table></div>")
+    a("<p>크기만 키운 것이 아니라 <b>배치 결정이 의미를 갖는 구조</b>를 넣었다. "
+      "트랙(감광액 도포·현상)을 노광에서 분리해 lot이 <code>트랙 → 노광 → 트랙</code>으로 "
+      f"오가게 했다 — 트랙이 최다 방문 그룹({mid_track_visits:.1f}회/lot)이 되고, "
+      "그룹별로만 뭉치는 배치는 이 왕복을 전부 bay 교차로 만든다. 식각·증착·계측도 "
+      "공정별로 세분해 그룹 수를 늘렸다.</p>")
+    a('<figure><div class="scroll">')
+    a(svg.layout_svg(mfab, mgeo, mid_family,
+                     title=f"midfab 기준선 — 공정 계열별 배치 ({len(mgeo.bays)} bay × "
+                           f"{mgeo.slot_count // len(mgeo.bays)} slot)"))
+    a("</div><figcaption>")
+    a("실무 fab은 그룹이 아니라 <b>공정 계열</b>로 구획한다(노광 계열, 식각 계열…). "
+      "트랙과 스캐너가 같은 계열이라 자연히 같은 구역에 놓인다. 이것을 기준선으로 "
+      "삼았다 — 무작위 배치를 이기는 것은 성과가 아니다.")
+    a("</figcaption></figure></section>")
+
+    # ---- 분해
+    a("<section>")
+    a('<span class="eyebrow">가장 결정적인 측정</span>')
+    a('<h2><span class="n">23</span>배치가 손댈 수 있는 것은 '
+      f'{dec["transport_hours"] / dec["cycle_hours"]:.1%}뿐이다</h2>')
+    a('<p class="lead">사이클타임을 세 항으로 나누면 최적화의 천장이 바로 나온다. '
+      "배치가 바꾸는 것은 <b>반송 항뿐</b>이다 — 설비 큐 대기는 대수와 부하가 정하고, "
+      "순수 처리시간은 공정이 정한다.</p>")
+    a('<figure><div class="scroll">')
+    a(svg.composition_svg(
+        [("순수 처리", dec["raw_hours"], "공정이 정한다 — 바꿀 수 없다"),
+         ("설비 큐 대기", dec["queue_hours"], "설비 대수와 부하가 정한다"),
+         ("반송 (대기 포함)", dec["transport_hours"], "배치가 바꿀 수 있는 전부")],
+        title=f"midfab 기준선 사이클타임 {dec['cycle_hours']:.1f}시간의 구성",
+        subtitle=f"계열별 배치 · 목표 {space['target_lots_per_day']:.2f} lot/일 · "
+                 f"{space['replications']}회 반복 × {space['run_days']:.0f}일",
+        highlight=2,
+    ))
+    a("</div><figcaption>")
+    a(f"반송을 <b>완전히 없애도</b> {dec['transport_hours'] / dec['cycle_hours']:.1%}다. "
+      "그리고 기준선이 이미 그 대부분을 확보하고 있으므로, 배치 최적화로 남은 여지는 "
+      "그보다 훨씬 작다. 규모를 3.7배로 키워도 이 비율은 거의 변하지 않았다 — "
+      "<b>탐색공간이 좁아서 여지가 없었던 것이 아니다.</b>")
+    a("</figcaption></figure>")
+
+    a("<h3>기하를 바꿔도 같다</h3>")
+    a("<p>같은 설비를 다른 bay 구성에 넣고, 대리지표 담금질로 배치를 최적화한 뒤 "
+      "DES로 검증했다.</p>")
+    a('<div class="tblwrap"><table>')
+    a("<thead><tr><th>기하</th><th>계열별 기준선</th><th>담금질 결과</th>"
+      "<th>쌍대 차이</th><th>bay 교차</th><th>대리지표 개선</th></tr></thead><tbody>")
+    for g in space["geometries"]:
+        a(f"<tr><td>{g['label']} (spine {g['spine_m']:.0f}m)</td>"
+          f"<td>{g['family_hours']:.1f}h</td><td>{g['anneal_hours']:.1f}h</td>"
+          f"<td>{g['delta']:+.1f} ± {g['ci']:.1f}h</td>"
+          f"<td>{g['family_interbay']:.0%} → {g['anneal_interbay']:.0%}</td>"
+          f"<td>{g['surrogate_gain']:+.0%}</td></tr>")
+    a("</tbody></table></div>")
+    a("<p>담금질은 대리지표를 크게 낮추고 bay 교차도 실제로 줄였다. 그런데 "
+      "<b>DES 사이클타임은 나아지지 않았다.</b> 줄인 것이 사이클타임의 5% 항의 일부이기 "
+      "때문이고, 그 크기가 측정 잡음보다 작기 때문이다.</p>")
+    a("</section>")
+
+    # ---- M5 게이트
+    a("<section>")
+    a('<span class="eyebrow">M5 게이트</span>')
+    a('<h2><span class="n">24</span>대리지표는 DES의 순위를 재현하는가</h2>')
+    a("<p class=\"lead\">2단 최적화(대리지표로 거르고 DES로 검증)는 <b>대리지표의 순위가 "
+      "DES와 맞을 때만</b> 성립한다. 맞지 않으면 담금질은 DES 기준으로 나쁜 해를 향해 "
+      "열심히 내려간다. 통과 기준을 미리 정해두고 쟀다 — "
+      f"순위상관 ρ ≥ {calib['gate']:.2f}.</p>")
+    a('<figure><div class="scroll">')
+    a(svg.scatter_svg(
+        gate_points, gate_series,
+        title="대리지표 점수 대 DES 실측 사이클타임",
+        subtitle=f"배치 {len(calib['rows'])}종 · 각 {calib['replications']}회 반복 × "
+                 f"{calib['run_days']:.0f}일 · 공통난수",
+        x_label="대리지표 점수 (낮을수록 좋다고 예측)",
+        y_label="DES 사이클타임 (시간)",
+        note=f"교차검증 홀드아웃 ρ = {calib['cv_rho']:+.3f} "
+             f"({calib['splits']}회 분할의 중앙값 · 10~90분위 "
+             f"{calib['cv_lo']:+.3f}~{calib['cv_hi']:+.3f})",
+    ))
+    a("</div><figcaption>")
+    a(f"판정 <b>{'통과' if calib['passed'] else '미달'}</b> — 교차검증 홀드아웃 "
+      f"ρ = {calib['cv_rho']:+.3f}로 기준 {calib['gate']:.2f}에 못 미친다. 가중치를 "
+      "맞추는 데 쓴 표본에서 재면 상관이 반드시 부풀려지므로"
+      f"(전체 적합 시 {calib['full_rho']:+.3f}) 분할을 "
+      f"{calib['splits']}회 반복해 중앙값으로 판정했다. 왼쪽 아래에 좋은 배치가, "
+      "오른쪽 위에 흩뿌린 배치가 몰려 있는 <b>두 덩어리</b> 구조가 보인다.")
+    a("</figcaption></figure>")
+
+    a("<h3>ρ가 낮은 이유 — 대리지표가 아니라 DES의 분해능 때문이다</h3>")
+    a("<p>순위상관은 <b>모든 쌍</b>을 채점한다. 그런데 두 배치의 사이클타임 차이가 "
+      "신뢰구간 안에 있으면 그 쌍의 “정답” 자체가 잡음이다. 대리지표가 아무리 좋아도 "
+      "그런 쌍은 절반쯤 틀리게 나온다. 즉 ρ는 대리지표의 성능과 DES의 분해능을 "
+      "섞어 재고 있다.</p>")
+    a("<p>그래서 <b>두 후보의 신뢰구간이 겹치지 않는 쌍</b>, 즉 DES 자신이 구분할 수 "
+      "있다고 말하는 쌍만 골라 다시 채점했다.</p>")
+    a('<div class="ba">')
+    a(f'<div><div class="lbl">채점 가능한 쌍</div><p>전체 {calib["all_pairs"]}쌍 중 '
+      f'<span class="num">{calib["resolvable_pairs"]}쌍</span><br>'
+      f'나머지 {calib["all_pairs"] - calib["resolvable_pairs"]}쌍은 DES도 구분하지 '
+      "못한다</p></div>")
+    a(f'<div><div class="lbl">그 쌍에서의 순서 정확도</div><p>'
+      f'<span class="num">{calib["resolvable_accuracy"]:.0%}</span><br>'
+      f"구분 가능한 쌍은 {'모두' if calib['resolvable_accuracy'] >= 0.999 else ''} "
+      "맞혔다</p></div>")
+    a("</div>")
+    a(f"<p>대리지표는 <b>구분할 수 있는 것은 전부 구분했다.</b> 게이트를 못 넘은 것은 "
+      f"대리지표가 틀려서가 아니라, 표본 쌍의 "
+      f"{1 - calib['resolvable_pairs'] / calib['all_pairs']:.0%}가 DES의 분해능 "
+      "밖에 있기 때문이다. <b>ρ ≥ 0.7이라는 게이트 기준 자체가 잘못된 계측기였다</b> — "
+      "설계 시점에는 DES 잡음의 크기를 몰랐다.</p>")
+
+    a("<h3>항별 기여가 설계 예상과 달랐다</h3>")
+    a("<p>설계서(§7.2)는 <b>스토커</b>(bay 경계 통과 비용)를 지배항으로 예상했다. "
+      "실측에서는 <b>가장 약한 항</b>이었다. 배치를 바꿔도 bay 교차 횟수는 크게 "
+      "변하지 않는 반면(85%↔100% 부근), 그룹을 쪼개느냐 마느냐는 크게 변하기 "
+      "때문이다.</p>")
+    a('<div class="tblwrap"><table>')
+    a("<thead><tr><th>항</th><th>단독 순위상관</th><th>표본 변동폭</th>"
+      "<th>적합 가중치</th><th>점수 기여</th></tr></thead><tbody>")
+    for label, key in (("스토커 (bay 경계 통과)", "stocker"),
+                       ("주행 (거리 ÷ 속도)", "travel"),
+                       ("서버 풀 분할", "split")):
+        a(f"<tr><td>{label}</td><td>{term_rho[key]:+.3f}</td>"
+          f"<td>{term_span[key]:.0f}분</td>"
+          f"<td>{calib['weights'][key]:.4f}</td>"
+          f"<td>{term_contrib[key] / sum(term_contrib.values()):.0%}</td></tr>")
+    a("</tbody></table></div>")
+
+    a("<h3>좋은 배치들 안에서는 아무것도 가르지 못한다</h3>")
+    a('<div class="ba">')
+    a(f'<div><div class="lbl">가르는 것</div><p>좋은 배치 대 나쁜 배치<br>'
+      f'전체 표본 폭 <span class="num">{gate_span:.0f}시간</span> '
+      f'({gate_lo:.0f}h ~ {gate_hi:.0f}h)</p></div>')
+    a(f'<div><div class="lbl">가르지 못하는 것</div><p>좋은 배치들 사이의 순서<br>'
+      f'상위 절반 폭 <span class="num">{calib["good_span_hours"]:.0f}시간</span> '
+      f'· 평균 신뢰구간 ±{calib["good_ci"]:.0f}시간 · 구분 가능한 쌍 '
+      f'{calib["good_resolvable_pairs"]}/{calib["good_all_pairs"]}</p></div>')
+    a("</div>")
+    a("<p>결론은 둘로 나뉜다. 대리지표는 <b>흩뿌린 배치를 걸러내는 필터로는 쓸 수 "
+      "있다</b> — 그 용도에서는 100% 정확했다. 그러나 <b>좋은 배치들 사이에 순위를 "
+      "매기는 데는 쓸 수 없다</b>. 쓸 수 없는 것이 아니라, 매길 순위가 없다 — "
+      "DES 실측으로도 그 배치들은 서로 구분되지 않는다. 배치를 정밀하게 최적화하려는 "
+      "시도는 여기서 멈춰야 한다.</p>")
+    a("</section>")
+
+    # ---- 대수 구성
+    a("<section>")
+    a('<span class="eyebrow">방향 전환</span>')
+    a(f'<h2><span class="n">25</span>진짜 레버는 대수 구성이다 — 같은 예산에서 '
+      f'{best_count["gain"]:+.1%}</h2>')
+    a("<p class=\"lead\">배치가 5% 항의 일부를 다투는 동안, <b>설비 큐 대기 "
+      f"{dec['queue_hours'] / dec['cycle_hours']:.0%}</b>는 손대지 않은 채였다. 예산을 "
+      "한 푼도 더 쓰지 않고 대수 구성만 바꿔 그 항을 공격했다 — 여유 있는 그룹의 설비를 "
+      "팔아 병목 그룹에 투자한다.</p>")
+    a('<figure><div class="scroll">')
+    a(svg.deviation_svg(
+        count_dev_rows,
+        title="예산 중립 대수 재구성 — 기준선 대비 사이클타임",
+        subtitle=f"모두 capex ≤ {space['budget']:.0f} (기준선과 동일) · "
+                 f"목표 처리량 {space['target_lots_per_day']:.2f} lot/일 충족",
+        legend="점 = 기준선 대비 사이클타임 · 회색 띠 = 쌍대 95% 신뢰구간 "
+               "(띠 안이면 차이가 유의하지 않다) · 왼쪽이 좋다",
+        mark_status=False,
+    ))
+    a("</div><figcaption>")
+    a(f"<b>{best_count['desc']}</b>이 사이클타임을 "
+      f"{space['baseline']['cycle_hours']:.1f} → {best_count['cycle_hours']:.1f}시간으로 "
+      f"줄였다({best_count['delta']:+.1f} ± {best_count['ci']:.1f}h, 통계적으로 유의). "
+      f"capex는 {best_count['capex']:.1f}로 예산 {space['budget']:.1f} 안이고 목표 "
+      "처리량도 지킨다. 배치로 얻을 수 있는 전부보다 <b>몇 배 큰 개선</b>이다.")
+    a("</figcaption></figure>")
+    a("<h3>유의한 개선 상위 구성</h3>")
+    a('<div class="tblwrap"><table>')
+    a("<thead><tr><th>추가 / 매각</th><th>사이클타임</th><th>기준선 대비(쌍대)</th>"
+      "<th>처리량</th><th>capex</th></tr></thead><tbody>")
+    for r in [x for x in space["counts"] if x["significant"] and x["delta"] < 0][:5]:
+        buy, _, sell = r["desc"].partition(" / ")
+        a(f"<tr><td><b>{buy}</b> / {sell or '—'}</td><td>{r['cycle_hours']:.1f}h</td>"
+          f"<td>{r['delta']:+.1f} ± {r['ci']:.1f}h</td>"
+          f"<td>{r['throughput']:.2f} lot/일</td><td>{r['capex']:.1f}</td></tr>")
+    a("</tbody></table></div>")
+    a("<p>주의할 점은 <b>방향을 잘못 잡으면 같은 크기로 나빠진다</b>는 것이다. 위 도표에서 "
+      "오른쪽에 있는 구성들은 여유 그룹을 너무 깎아 그 그룹을 새 병목으로 만들었다. "
+      "해석적 여유(대기를 무시한 값)만 보고 고르면 이 함정에 빠진다 — 특히 배치 설비는 "
+      "부분 배치와 “배치 시간 = 구성원 최댓값” 때문에 해석적 능력이 낙관적으로 나온다."
+      "</p>")
+    a("</section>")
+
+    # ---- 결론
+    a("<section>")
+    a('<span class="eyebrow">M6 설계에 주는 결론</span>')
+    a('<h2><span class="n">26</span>최적화 대상의 우선순위를 뒤집는다</h2>')
+    a('<p class="lead">이 프로젝트는 “설비 배치 최적화”로 시작했다. 측정 결과는 '
+      "<b>배치가 종속 변수</b>임을 가리킨다.</p>")
+    a('<div class="tblwrap"><table>')
+    a("<thead><tr><th>결정 변수</th><th>실측 레버</th><th>평가 비용</th>"
+      "<th>M6에서의 위치</th></tr></thead><tbody>")
+    a(f"<tr><td><b>설비 대수 구성</b></td><td>{best_count['gain']:+.1%} (유의)</td>"
+      "<td>해석적 능력으로 즉시 스크리닝</td><td><b>주 결정 변수</b></td></tr>")
+    a(f"<tr><td>배치 (bay 배정)</td>"
+      f"<td>천장 {dec['transport_hours'] / dec['cycle_hours']:.1%}, 기준선 대비 유의차 "
+      "없음</td><td>대리지표 밀리초 · DES 17초</td>"
+      "<td>나쁜 해를 피하는 수준</td></tr>")
+    a("<tr><td>반송차 대수</td><td>가동률 여유가 있어 병목이 아님</td>"
+      "<td>즉시</td><td>예산 재원으로만 취급</td></tr>")
+    a("</tbody></table></div>")
+    a("<p>따라서 M6은 <b>대수 구성 탐색을 중심</b>에 둔다. 대수 구성은 해석적 능력 "
+      "계산만으로 대부분을 즉시 걸러낼 수 있어 탐색 비용이 배치보다 훨씬 싸고, 레버는 "
+      "몇 배 크다. 배치는 그 위에서 대리지표로 <b>나쁜 배치를 피하는</b> 역할을 맡는다 — "
+      f"구분 가능한 쌍에서의 정확도 {calib['resolvable_accuracy']:.0%}가 정확히 "
+      "그만큼은 보장한다.</p>")
+    a("<p>이 전환은 프로젝트의 축소가 아니다. 원래 질문이 “같은 돈으로 사이클타임을 "
+      "얼마나 줄일 수 있는가”였고, 그 답이 배치가 아니라 대수 구성에 있다는 것을 "
+      "<b>측정으로 확인했다</b>. 배치 시뮬레이터가 없었다면 이 결론에 도달할 수 없었다.</p>")
+    a("</section>")
+
     # ---- 다음
     a("<section>")
     a('<span class="eyebrow">다음 단계</span>')
-    a('<h2><span class="n">22</span>M5 · 대리지표 게이트와 미해결 항목</h2>')
-    a("<h3>M5에서 할 일 — 이제 더 중요해졌다</h3>")
-    a("<p>M4의 잡음 측정 결과가 M5의 위상을 바꿨다. DES 평가는 후보 1개에 "
-      f"{eval_seconds:.0f}초가 들고 쌍대 신뢰구간이 ±{climb_ci:.1f}시간인데, 찾는 개선은 "
-      f"{abs(climb_delta):.1f}시간 규모다. <b>DES를 직접 수천 번 돌리는 최적화는 성립하지 "
-      "않는다.</b> 결정론적이라 잡음이 0인 대리지표로 후보를 걸러내는 2단 구조가 "
-      "선택이 아니라 필수가 됐다.</p>")
+    a('<h2><span class="n">27</span>M6 · 대수 구성 최적화기와 미해결 항목</h2>')
+    a("<h3>M6에서 만들 것</h3>")
     a('<ul class="plain">')
-    a("<li><b>대리지표 설계</b> — M1에서 확인했듯 스토커 항이 반송 부하의 지배항이므로, "
-      "흐름-거리만이 아니라 <b>bay 교차 횟수</b>를 주항으로 담아야 한다. 여기에 M3에서 "
-      "드러난 <b>서버 풀 분할</b>(그룹이 여러 bay로 흩어지면 대기가 는다)을 더한다</li>")
-    a(f"<li><b>게이트 판정</b> — 무작위 후보 100개의 대리지표 점수와 DES 실측 사이클타임의 "
-      f"순위상관 ρ ≥ 0.7. 이번에 만든 무작위 표본 {len(random_vals)}개가 "
-      "그 실험의 축소판이다</li>")
-    a("<li><b>미달 시 대안</b> — 대리모델 학습(회귀), 또는 탐색공간을 넓혀(기하 확대) "
-      "레버 자체를 키우는 방향</li>")
+    a("<li><b>대수 구성 탐색</b> — 예산 중립 재구성을 체계적으로 훑는다. 해석적 능력으로 "
+      "목표 처리량을 못 넘는 구성을 즉시 버리므로 후보 대부분이 DES 없이 걸러진다. "
+      "이번에 손으로 훑은 "
+      f"{len(space['counts'])}개 구성 중 유의한 개선은 "
+      f"{sum(1 for r in space['counts'] if r['significant'] and r['delta'] < 0)}개였고, "
+      f"유의하게 <b>나빠진</b> 것도 "
+      f"{sum(1 for r in space['counts'] if r['significant'] and r['delta'] > 0)}개다 — "
+      "탐색이 방향을 가려야 한다</li>")
+    a("<li><b>배치 담금질을 그 위에 얹는다</b> — 대리지표로 나쁜 배치를 피하는 역할. "
+      "<code>opt/anneal.py</code>가 이미 그것이다. 게이트는 미달했지만 구분 가능한 "
+      f"쌍에서의 정확도가 {calib['resolvable_accuracy']:.0%}이므로 필터로는 쓴다. "
+      "좋은 배치들 사이에서는 DES 검증이 의미를 갖지 못하므로 <b>상위 몇 개를 DES로 "
+      "재확인하는 단계는 생략</b>하고 대리지표 최선을 그대로 쓴다</li>")
+    a("<li><b>배치 그룹의 스크리닝 보정</b> — 확산로의 설계 여유는 1.10이었으나 DES "
+      "부하율은 100%였다. 부분 배치와 “배치 시간 = 구성원 최댓값” 때문에 "
+      "<code>analytic_capacity</code>가 배치 그룹에 대해 낙관적이다. 스크리닝에서 배치 "
+      "그룹에는 별도 여유를 둬야 한다</li>")
     a("</ul>")
     a("<h3>확인이 필요한 항목</h3>")
     a('<ul class="checks">')
-    a('<li class="open"><b>장비 상대 단가표</b> — 현재는 자리표시자(스캐너 10 / 계측 1.2 등)다. '
-      "설비 대수를 결정 변수로 두는 이상 capex 예산 제약이 없으면 최적화가 퇴화하므로, "
-      "이 표가 결과의 절대적 타당성을 좌우한다. M6 이전에 확정하면 된다.</li>")
+    a('<li class="open"><b>장비 상대 단가표</b> — 현재는 자리표시자(ArF 스캐너 14 / '
+      "CD계측 1.2 등)다. <b>대수 구성이 주 결정 변수가 된 이상 이 표가 결과를 직접 "
+      "결정한다</b> — 어느 설비를 팔아 어느 설비를 살지가 단가 비율로 정해지기 때문이다. "
+      "M5까지는 “M6 전에 확정하면 되는 항목”이었으나 이제 가장 시급한 항목이다.</li>")
     a('<li class="open"><b>스토커 시간 120초의 근거</b> — 실제 fab 값을 아신다면 교체가 '
-      "필요하다. 이 값이 배치 최적화의 레버 크기를 직접 결정한다.</li>")
-    a('<li class="open"><b>빈차 회송 계수 0.6</b> — 해석적으로 구할 수 없어 근사로 두었다. '
-      "M4에서 DES 실측으로 교정한다.</li>")
+      "필요하다. 다만 반송 항 자체가 사이클타임의 "
+      f"{dec['transport_hours'] / dec['cycle_hours']:.0%}로 확인됐으므로, 이 값이 두 배로 "
+      "틀렸어도 결론(대수 구성이 주 레버)은 바뀌지 않는다.</li>")
+    a('<li class="open"><b>빈차 회송 계수 0.6</b> — 해석적 반송 부하 추정에만 쓰이고 '
+      "DES는 실제 회송을 시뮬레이션한다. 영향 범위가 좁아 우선순위를 낮춘다.</li>")
     a("</ul></section>")
 
     a("<footer>")
-    a(f"fab_layout_opt · 브랜치 <code>claude/fab-equipment-layout-simulator-861iyt</code> · "
-      f"도표는 <code>scripts/build_report.py</code>가 현재 코드로 계산해 생성한다. "
-      f"설계서는 <code>docs/SPEC.md</code>.")
+    a("fab_layout_opt · 브랜치 <code>claude/fab-equipment-layout-simulator-861iyt</code> · "
+      "도표는 <code>scripts/build_report.py</code>가 현재 코드로 계산해 생성한다. "
+      "M5 구간의 수치만은 <code>scripts/calibrate_surrogate.py</code>와 "
+      "<code>scripts/expand_space.py</code>가 남긴 "
+      f"<code>results/*.json</code>에서 읽는다 (측정 {space['generated_at'][:10]}, "
+      f"합계 {(space['elapsed_seconds'] + calib['elapsed_seconds']) / 60:.0f}분). "
+      "설계서는 <code>docs/SPEC.md</code>.")
     a("</footer></div>")
 
     return (
-        f"<title>fab_layout_opt — M1 진행 리포트</title>\n<style>{CSS}</style>\n"
+        f"<title>fab_layout_opt — M5 진행 리포트</title>\n<style>{CSS}</style>\n"
         + "\n".join(h)
     )
 

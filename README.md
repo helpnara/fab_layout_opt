@@ -2,42 +2,74 @@
 
 반도체 공장(fab) 설비 배치 최적화 시뮬레이터.
 
-Bay 구조 클린룸에서 설비를 어디에 놓고 몇 대를 사야 사이클타임과 처리량이 좋아지는지를
-이산사건 시뮬레이션(DES)으로 평가하고 최적화한다.
+Bay 구조 클린룸에서 설비를 어디에 놓고 몇 대를 사야 사이클타임이 짧아지는지를
+이산사건 시뮬레이션(DES)으로 평가한다.
 
 ## 현재 상태
 
-**설계 단계.** 구현 코드는 아직 없다. 상세 설계는 [`docs/SPEC.md`](docs/SPEC.md)를 참조.
+**M5 완료** — 코어 모델, DES 엔진, 목표 함수, 대리지표까지 구현했다. 상세 설계와
+구현 중 확정된 변경 사항은 [`docs/SPEC.md`](docs/SPEC.md)에 있다.
+
+| | |
+|---|---|
+| M1 | 코어 모델 · 내장 데이터셋 · 거리 행렬 · SVG 배치도 |
+| M2 | DES 엔진 (해석적 상한 · M/G/1 · SimPy 3중 교차검증) |
+| M3 | 설비 고장 · 배치 설비 · 반송차 대수 제한 |
+| M4 | 목표 함수 · 지속 가능성 판정 · CLI · 탐색공간 사전 점검 |
+| M5 | 탐색공간 확대(`midfab`) · 대리지표 담금질 · 게이트 판정 |
+| M6 | **다음** — 대수 구성 최적화기 |
+
+## 측정으로 확인한 것
+
+이 프로젝트는 "설비 **배치** 최적화"로 시작했다. 실측은 배치가 종속 변수임을 가리킨다.
+
+`midfab`(설비 77대 · bay 12개) 기준선의 사이클타임 184.9시간을 분해하면
+
+    순수 처리     84.7h  (45.8%)   공정이 정한다
+    설비 큐 대기   90.6h  (49.0%)   설비 대수와 부하가 정한다
+    반송           9.6h  ( 5.2%)   배치가 손댈 수 있는 전부
+
+반송을 완전히 없애도 5.2%이고, 실무 관행 배치(공정 계열별)가 이미 그 대부분을
+확보하고 있다. 반면 **같은 예산 안에서 대수를 재배분**하면 사이클타임이 184.9 →
+157.9시간이 됐다(−14.6%, 쌍대 −27.0 ± 7.9h로 유의). 따라서 M6부터는 대수 구성이
+주 결정 변수이고 배치는 나쁜 해를 피하는 수준으로 다룬다.
 
 ## 개요
 
 | 항목 | 내용 |
 |---|---|
-| 목표 지표 | 사이클타임 / 처리량 (생산능력 = 병목 포화 지점의 생산량) |
-| 규모 | 설비 10~40대 소규모 fab (내장 데이터셋은 21대) |
-| 공간 모델 | 중앙 spine 통로 + 양측 bay, bay당 slot 6개 |
-| 결정 변수 | 설비→bay/slot 배치, 그룹별 설비 대수, 반송기 대수 |
-| 제약 | slot 배타, capex 예산, 사이클타임 상한 |
-| 모델링 요소 | 재진입 흐름, 설비 고장(MTBF/MTTR), 배치 설비, 반송기 대수 제한 |
-| 최적화 | 2단 구조 — 거리 대리지표로 스크리닝 → DES로 검증 |
-| 기준선 | 기능별 배치(동종 설비를 한 bay에) = 실무 관행 |
-| 산출물 | Python 코어 라이브러리 + CLI + FastAPI + 정적 웹 UI |
+| 목적 함수 | capex 예산 제약 하에서 목표 처리량을 만족하며 **사이클타임 최소화** |
+| 결정 변수 | 그룹별 설비 대수(주) · 설비→bay/slot 배치(보조) · 반송차 대수 |
+| 제약 | slot 배타, capex 예산, 지속 가능한 처리량 ≥ 목표 |
+| 공간 모델 | 중앙 spine 통로 + 수직 bay, bay 안은 양벽 배치 |
+| 모델링 요소 | 재진입 흐름, 설비 고장(MTBF/MTTR, 가동시간 기준), 배치 설비, 반송차 대수 제한, 스토커 경유 |
+| 내장 데이터셋 | `smallfab-21` (설비 21대 · 5 bay) · `midfab` (설비 77대 · 12 bay) |
+| 기준선 | 공정 계열별 배치 = 실무 관행. 무작위 배치를 이기는 것은 성과가 아니다 |
 
-## 계획된 사용법
+## 사용법
 
 ```bash
-# 기준선 시뮬레이션
-fablayout simulate --scenario scenario.yaml
+pip install -e ".[dev]"
 
-# 최적화 (2단 파이프라인)
-fablayout optimize --scenario scenario.yaml --budget-same-as-baseline
+fablayout evaluate      # 기준선을 목표 함수로 평가
+fablayout compare       # 기준선 배치 3종을 쌍대 비교
+fablayout capacity      # 지속 가능한 최대 처리량 탐색
+fablayout simulate      # 한 지점 시뮬레이션 + 그룹별 진단
+fablayout report        # 누적 진행 리포트(HTML) 생성
+```
 
-# 웹 UI
-uvicorn fablayout.api.app:app --reload
+실험 스크립트는 결과를 `results/*.json`에 남기고, 리포트가 그것을 읽는다
+([`results/README.md`](results/README.md) 참조).
+
+```bash
+python scripts/calibrate_surrogate.py --out results/surrogate_calibration.json
+python scripts/expand_space.py        --out results/midfab_space.json
+python scripts/build_report.py        --out report.html
 ```
 
 ## 데이터 출처에 관한 주의
 
-내장 데이터셋 `smallfab-21`은 SMT2020 / MIMAC 벤치마크의 **구조를 참조한 합성 데이터**이며
-원본 수치가 아니다. 원본 파일을 확보한 경우 `data/loaders/` 의 로더로 읽을 수 있다.
-자세한 배경은 [`docs/SPEC.md` §4.1](docs/SPEC.md)에 있다.
+내장 데이터셋은 SMT2020 / MIMAC 벤치마크의 **구조를 참조한 합성 데이터**이며 원본
+수치가 아니다. 장비 단가표도 상대적 순서만 반영한 자리표시자다 — 대수 구성이 주
+결정 변수인 이상 이 표가 결과의 타당성을 직접 결정하므로, 실제 값을 아는 경우
+`opt/cost.py`의 `CostModel`에서 교체해야 한다.
